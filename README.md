@@ -43,8 +43,6 @@ Most agent prompts for “check my code for security” stay one-shot and shallo
 | **Coverage** | Vulnerability catalog + language traps + crypto checks—aligned with **OWASP** / **CWE** framing. |
 | **Delivery** | One stable finding schema and remediation patterns your team can diff in Git. |
 
----
-
 <h2 id="features">✨ Features</h2>
 
 | Feature | Notes |
@@ -55,25 +53,29 @@ Most agent prompts for “check my code for security” stay one-shot and shallo
 | 📊 **Parseable output** | Shared schema in [`05-output-format.md`](./skill/references/05-output-format.md). |
 | 🛠️ **Real fixes** | Language-aware remediation in [`06-remediation.md`](./skill/references/06-remediation.md). |
 
----
-
 <h2 id="how-it-works">🧭 How it works</h2>
 
 Your agent loads **[`skill/SKILL.md`](./skill/SKILL.md)** first, then walks the numbered chain under **`skill/references/`** **before** touching application code. Each file is a single concern—easy to extend, pin, or fork.
 
 ```mermaid
-flowchart LR
-  A[skill/SKILL.md] --> B[00 Identity]
-  B --> C[01 Methodology]
-  C --> D[02 Vulnerabilities]
-  D --> E[03 Languages]
-  E --> F[04 Crypto]
-  F --> G[05 Output]
-  G --> H[06 Remediation]
-  H --> I[Target source code]
-```
+flowchart TD
+  A[Load skill/SKILL.md] --> B[Build review plan<br/>01-methodology]
+  A --> C[Set constraints<br/>00-identity]
 
----
+  B --> D[Analyze target source code]
+  C --> D
+
+  D --> E[Classify findings<br/>02-vulnerability-classes]
+  D --> F[Apply language checks<br/>03-language-specific]
+  D --> G[Apply crypto checks<br/>04-cryptography]
+
+  E --> H[Normalize into schema<br/>05-output-format]
+  F --> H
+  G --> H
+
+  H --> I[Propose concrete fixes<br/>06-remediation]
+  I --> J[Deliver prioritized report]
+```
 
 <h2 id="quick-start">🚀 Quick start</h2>
 
@@ -97,8 +99,6 @@ Whole tree:
 Load the AppSec skill, then analyze all source files under path/to/project/ for security vulnerabilities.
 ```
 
----
-
 <h2 id="skill-modules">📚 Skill modules</h2>
 
 | # | Reference | Covers |
@@ -110,8 +110,6 @@ Load the AppSec skill, then analyze all source files under path/to/project/ for 
 | 04 | [`04-cryptography.md`](./skill/references/04-cryptography.md) | Crypto checks |
 | 05 | [`05-output-format.md`](./skill/references/05-output-format.md) | Finding schema |
 | 06 | [`06-remediation.md`](./skill/references/06-remediation.md) | Fix patterns |
-
----
 
 <h2 id="structured-output-preview">👀 Structured output preview</h2>
 
@@ -174,8 +172,6 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 
 </details>
 
----
-
 <h2 id="agent-skills-layout">📐 Skill layout</h2>
 
 [`skill/`](./skill/) matches **[Open Agent Skills](https://openagentskills.dev/docs/specification)**, the community **SKILL.md** convention maintained alongside **[agentskills/agentskills](https://github.com/agentskills/agentskills)**. Whether a host accepts this tree unchanged depends on **its** loader rules.
@@ -191,8 +187,6 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 
 *Examples only; not exhaustive or endorsed:* **Claude Code**, **Cursor**, **Kiro**, and similar hosts may ingest [`skill/`](./skill/) unchanged once discovery matches—confirm in upstream docs.
 
----
-
 <h2 id="repository-layout">🗂️ Repository layout</h2>
 
 | Path | Role |
@@ -201,8 +195,6 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 | [`skill/`](./skill/) | **The product:** [`SKILL.md`](./skill/SKILL.md) + [`references/`](./skill/references/) |
 | [`benchmark/`](./benchmark/) | Optional maintainer harness — [evaluation](#maintainers-evaluation-harness) |
 | [`.cursor/skills/`](./.cursor/skills/) | Small Cursor stubs for that harness only |
-
----
 
 <h2 id="maintainers-evaluation-harness">🛠️ Maintainers · evaluation harness</h2>
 
@@ -213,13 +205,9 @@ START=1 END=30 MAX_PARALLEL=30 ./benchmark/findings.sh
 START=1 END=30 MAX_PARALLEL=30 ./benchmark/scoring.sh
 ```
 
----
-
 <h2 id="contributing">🤝 Contributing</h2>
 
 Improvements to skills or docs are welcome—**small, focused PRs** make it easier to review security-sensitive wording.
-
----
 
 <h2 id="license">📄 License</h2>
 
