@@ -1,0 +1,319 @@
+Now I have all files. Let me perform the three-pass analysis.
+
+---
+
+## Pass 1 — Triage
+
+**Stack:** Python 3.12 / Flask (dev server), Nginx reverse proxy, Docker Compose.
+
+**Entry points:**
+- Nginx port 80 → proxies to Flask at `host.docker.internal:5000`
+- Flask port **5000 directly exposed** via `docker-compose.yml` `ports: "5000:5000"`
+
+**Routes:** `GET /` (public), `GET /admin` (should be restricted)
+
+**Trust boundaries:**
+- Nginx is the intended perimeter for `/admin` protection (`deny all`)
+- Flask has zero application-layer access control
+- Flask directly reachable on port 5000 from the host — bypasses Nginx entirely
+
+**Multi-layer routing signal present:** Nginx exact-match rule `= /admin` vs. Flask route `@app.route('/admin')`.
+
+---
+
+## Pass 2 — Deep Scan
+
+**Critical:** docker-compose `ports: "5000:5000"` makes Flask directly reachable. Nginx ACL is irrelevant for anyone who connects on port 5000.
+
+**High:** `/admin` route in Flask has no auth decorator, no session check, no middleware — sole protection is the Nginx `deny all` rule.
+
+**Medium:** `location = /admin` exact match does not block `/admin/`. Flask's default `strict_slashes=True` causes Flask to issue a 308 redirect for `/admin/` back to `/admin`, so through the Nginx proxy the handler doesn't execute — but via direct port 5000 access the redirect resolves within Flask itself (`/admin/` → 308 → `/admin` → handler executes).
+
+**Low:** `app.run()` with no `debug=False` uses Flask's single-threaded development server; not suitable for production.
+
+**Info:** Nginx emits no security headers (HSTS, X-Frame-Options, X-Content-Type-Options, CSP).
+
+---
+
+## Pass 3 — Validation
+
+- Finding 1 (direct port exposure): reachable by any attacker who can reach the host's port 5000 — confirmed by docker-compose `ports` declaration.
+- Finding 2 (missing app-layer auth): zero mitigating controls in Flask. No decorator, no middleware, no WSGI gate.
+- Finding 3 (nginx exact-match bypass): exploitability through nginx proxy is low due to Flask's redirect behavior, but exploitability through port 5000 makes this a real path. Keeps MEDIUM.
+- Finding 4 (dev server): Flask default is `debug=False`, so no Werkzeug debugger PIN leak — but the WSGI server is still single-threaded/non-production. LOW.
+- Finding 5 (headers): negligible for current content, INFO.
+
+All five findings survive Pass 3. Ordered by practical risk below.
+
+---
+
+## Finding 1: Missing Application-Layer Authentication + Direct Flask Exposure
+
+**File:** `docker-compose.yml`
+**Lines:** 7
+**CWE:** CWE-284 — Improper Access Control / CWE-862 — Missing Authorization
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```yaml
+ports:
+  - "5000:5000"
+```
+```python
+@app.route('/admin')
+def admin():
+    return "Admin area accessed!"
+```
+
+### Description
+The docker-compose file publishes Flask's port 5000 directly to the host network interface. Any client that can reach the host on port 5000 communicates directly with Flask, completely bypassing the Nginx reverse proxy and its `deny all` rule. Because Flask's `/admin` route carries zero authentication logic (no login check, no session assertion, no decorator), the route returns its response to any unauthenticated caller. An attacker makes a single HTTP request — `GET http://target:5000/admin` — and receives the admin response with no credentials required. The Nginx access-control layer is fully negated.
+
+### Prioritization
+Highest priority. No preconditions beyond network reachability of port 5000, which is guaranteed by the compose file. The entire security model of the deployment depends on Nginx blocking `/admin`, but that model fails completely when Flask is independently reachable.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must be able to reach the host on port 5000 (LAN, cloud VM with open SG, misconfigured firewall). The compose file guarantees this binding exists.
+- **Uncertainty Boundary:** A host-level firewall or cloud security group that blocks port 5000 from untrusted networks would reduce external reachability, but the exposure to the host and any co-resident container remains.
+
+### Remediation
+
+**Step 1 — Remove the direct port binding** (docker-compose.yml): Flask should be reachable only within the Docker network via Nginx.
+
+```yaml
+# Before
+services:
+  flask-app:
+    build: .
+    ports:
+      - "5000:5000"    # ← exposes Flask to the host
+    networks:
+      - app-network
+
+# After
+services:
+  flask-app:
+    build: .
+    # No ports: block — Flask is only reachable inside app-network via Nginx
+    networks:
+      - app-network
+```
+
+**Step 2 — Add application-layer authentication** (main.py): Nginx `deny all` is defense-in-depth, not the sole gate. Protect the route in Flask itself.
+
+```python
+from flask import Flask, abort, request, session
+from functools import wraps
+
+app = Flask(__name__)
+app.secret_key = "..."  # load from env var, not hardcoded
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("authenticated"):
+            abort(401)
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/admin')
+@login_required
+def admin():
+    return "Admin area accessed!"
+```
+
+Why: defense in depth requires the resource itself to enforce authorization, independent of any upstream proxy. A proxy can be bypassed, misconfigured, or restarted without the app's knowledge.
+
+### References
+- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+- https://cwe.mitre.org/data/definitions/862.html
+
+---
+
+## Finding 2: Nginx Exact-Match Rule Bypassed by Trailing Slash
+
+**File:** `nginx.conf`
+**Lines:** 11
+**CWE:** CWE-284 — Improper Access Control
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```nginx
+location = /admin {
+    deny all;
+}
+
+location / {
+    proxy_pass http://host.docker.internal:5000;
+}
+```
+
+### Description
+The Nginx `=` modifier performs a case-sensitive, byte-exact match against the normalized URI. It matches only `/admin` — not `/admin/`. A request for `/admin/` does not match the deny rule; Nginx falls through to `location /` and proxies the request to Flask. Flask's default `strict_slashes=True` responds to `/admin/` with a `308 Permanent Redirect` to `/admin`, which the browser then re-requests — Nginx blocks that follow-up. However, this protection breaks down as soon as port 5000 is directly reachable (Finding 1): an attacker sends `GET /admin/` to port 5000, Flask redirects to `/admin`, and the second request — also on port 5000 — executes the admin handler with no Nginx in the path. Even without the port-5000 exposure, the exact-match rule is narrower than the intended "block all admin access" policy and represents a fragile, easy-to-defeat control.
+
+### Prioritization
+P1 in combination with Finding 1 (the trailing-slash path is the exploit chain). As a standalone finding it is HIGH because the narrow exact match creates exploitable risk whenever port exposure changes or a redirect-ignorant HTTP client is used.
+
+**Counterfactual:** Changing the nginx rule to `location ^~ /admin` (prefix match, case-sensitive) would block all paths starting with `/admin` including `/admin/`, `/admin/settings`, etc., eliminating this bypass class at the edge layer.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker reaches Flask on port 5000 (guaranteed by Finding 1), or uses a client that does not follow 308 redirects and the server returns meaningful content in the redirect response.
+- **Uncertainty Boundary:** Flask's `strict_slashes` default may differ across versions; if an operator sets `strict_slashes=False`, the handler executes directly for `/admin/` even through the nginx proxy path.
+
+### Remediation
+
+```nginx
+# Before — exact match blocks only /admin
+location = /admin {
+    deny all;
+}
+
+# After — prefix match blocks /admin, /admin/, /admin/*, etc.
+location ^~ /admin {
+    deny all;
+}
+```
+
+Additionally, remove the direct port binding (see Finding 1) so the nginx layer cannot be circumvented entirely.
+
+### References
+- https://nginx.org/en/docs/http/ngx_http_core_module.html#location
+- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+
+---
+
+## Finding 3: Flask Development Server Used in Production
+
+**File:** `main.py`
+**Lines:** 13–14
+**CWE:** CWE-16 — Configuration
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```python
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000)
+```
+
+### Description
+`app.run()` starts Flask's built-in Werkzeug development WSGI server. This server is explicitly documented as "not designed to be particularly efficient, stable, or secure" and should not be used in production. The default is `debug=False`, so the interactive Werkzeug debugger (which provides PIN-protected code execution) is not exposed — but the server is still single-threaded, lacks worker process management, and does not handle production signal handling or graceful reload.
+
+### Prioritization
+P3. Lower priority than Findings 1 and 2. No direct security exploit path at current code scale, but becomes meaningful under concurrent load or if `debug=True` is accidentally set.
+
+### Exploitability Notes
+- **Exploit Preconditions:** `debug=True` would expose Werkzeug's interactive debugger; at `debug=False` the risk is availability and stability rather than confidentiality/integrity.
+- **Uncertainty Boundary:** If the `DEBUG` environment variable or any config overrides `debug=False`, the Werkzeug PIN-protected debugger becomes active — that is a CRITICAL finding in itself.
+
+### Remediation
+
+Use a production WSGI server. Add Gunicorn to the Pipfile and update the Dockerfile:
+
+```toml
+# Pipfile
+[packages]
+flask = "*"
+gunicorn = "*"
+```
+
+```dockerfile
+# Dockerfile — replace CMD
+CMD ["gunicorn", "--workers", "4", "--bind", "0.0.0.0:5000", "main:app"]
+```
+
+Remove the `if __name__ == "__main__"` block from `main.py`, or keep it for local dev only and ensure it is never the production entrypoint.
+
+### References
+- https://flask.palletsprojects.com/en/stable/deploying/
+- https://cwe.mitre.org/data/definitions/16.html
+
+---
+
+## Finding 4: Missing HTTP Security Headers
+
+**File:** `nginx.conf`
+**Lines:** 1–20
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** INFO
+**Confidence:** HIGH
+
+### Vulnerable Code
+```nginx
+location / {
+    proxy_pass http://host.docker.internal:5000;
+}
+# No add_header directives anywhere in the server block
+```
+
+### Description
+The Nginx configuration sets no security response headers. Missing headers allow browsers to perform MIME-type sniffing (`X-Content-Type-Options`), enable clickjacking via iframe embedding (`X-Frame-Options`), omit transport enforcement (`Strict-Transport-Security`), and lack any content security policy boundary. While the current application serves only plain text, these headers are structural mitigations that should be present before any content expansion.
+
+### Prioritization
+P3 / INFO. No direct exploitation path on current content. Add before the application gains user-facing HTML pages.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires an attacker-controlled content context (e.g., future HTML pages, user-generated content) to exploit missing CSP or X-Content-Type-Options.
+- **Uncertainty Boundary:** TLS is not configured; HSTS is irrelevant until HTTPS is added, but should be included in the hardening plan.
+
+### Remediation
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    # Security headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'" always;
+    # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    # ^ enable once HTTPS is configured
+
+    location = /admin {
+        deny all;
+    }
+
+    location / {
+        proxy_pass http://flask-app:5000;  # use service name, not host.docker.internal
+    }
+}
+```
+
+### References
+- https://owasp.org/www-project-secure-headers/
+- https://cwe.mitre.org/data/definitions/693.html
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 5     |
+| Total Findings  | 4     |
+| Critical        | 1     |
+| High            | 1     |
+| Medium          | 0     |
+| Low             | 1     |
+| Info            | 1     |
+```
+
+### Key Risks
+The most severe issue is the combination of direct Flask port exposure (docker-compose `ports: "5000:5000"`) and the complete absence of application-layer authentication on `/admin` — together they provide unauthenticated admin access to any host-reachable client with a single HTTP request, making the Nginx `deny all` rule entirely ineffective. The nginx exact-match rule (`= /admin`) amplifies the risk by also being exploitable via trailing-slash normalization once the bypass route to port 5000 exists.
+
+### Prioritization Notes
+Findings 1 and 2 are ordered first because they share a direct, zero-precondition exploit path (one `curl` command to port 5000). Finding 3 (dev server) and Finding 4 (headers) are structural hardening gaps with no immediate exploit path at current application scope.

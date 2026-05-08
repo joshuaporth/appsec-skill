@@ -1,0 +1,362 @@
+Reference modules fully loaded. Now performing the three-pass security review.
+
+---
+
+## Pass 1 — Attack Surface Triage (internal)
+
+- **Language/Framework:** Go 1.20, `net/http`, `go.mongodb.org/mongo-driver`
+- **Entry point:** `POST /login` — unauthenticated, accepts arbitrary JSON body
+- **Sensitive operations:** MongoDB `FindOne` with attacker-controlled filter; password storage/comparison; credential seeding
+- **Trust boundary:** HTTP request body is fully attacker-controlled; MongoDB is an internal service
+- **Third-party:** MongoDB Go driver — safe when used with typed structs/parameterized queries; dangerous when fed raw `map[string]interface{}`
+
+---
+
+## Pass 2 — Deep Scan / Pass 3 — Validation
+
+Five findings confirmed. Ordered by exploitability and impact.
+
+---
+
+## Finding 1: NoSQL Injection (MongoDB Operator Injection)
+
+**File:** `main.go`
+**Lines:** 33–43
+**CWE:** CWE-943 — Improper Neutralization of Special Elements in Data Query Logic
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+var creds map[string]interface{}
+if json.NewDecoder(r.Body).Decode(&creds) != nil {
+    http.Error(w, "Invalid request", http.StatusBadRequest)
+    return
+}
+
+users := client.Database("testdb").Collection("users")
+if users.FindOne(context.TODO(), creds).Err() != nil {
+    http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+    return
+}
+```
+
+### Description
+The JSON request body is decoded into `map[string]interface{}` and passed **directly and unmodified** as the MongoDB query filter. Because the map type preserves `$`-prefixed keys, an attacker can inject MongoDB query operators into the filter document. Sending `{"username": "admin", "password": {"$ne": "x"}}` constructs the filter `{username: "admin", password: {$ne: "x"}}`, which matches the admin document regardless of the real password — granting full authentication bypass. An attacker can authenticate as any user in the database without knowing any credentials.
+
+### Prioritization
+Highest priority. Zero preconditions: a single unauthenticated HTTP request achieves full authentication bypass on the admin account. No exploitation complexity. Direct impact on authentication integrity.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 8081. No account, session, or prior knowledge required.
+- **Uncertainty Boundary:** None — the Go MongoDB driver BSON-encodes `map[string]interface{}` preserving operator keys; this is directly exploitable as written.
+
+**Concrete attacker-controlled input:**
+```json
+POST /login HTTP/1.1
+Content-Type: application/json
+
+{"username": "admin", "password": {"$ne": "wrong"}}
+```
+Response: `Login successful`
+
+**Counterfactual invalidation:** Replacing `map[string]interface{}` with a typed `User` struct and building the query explicitly with `bson.D` would eliminate the operator injection surface entirely.
+
+### Remediation
+Decode into a typed struct and construct the filter explicitly, so only literal string values ever reach the query:
+
+```go
+// Before — passes raw attacker map as filter
+var creds map[string]interface{}
+json.NewDecoder(r.Body).Decode(&creds)
+users.FindOne(context.TODO(), creds)
+
+// After — typed struct + explicit filter
+type LoginRequest struct {
+    Username string `json:"username"`
+    Password string `json:"password"`
+}
+
+var req LoginRequest
+if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+    http.Error(w, "Invalid request", http.StatusBadRequest)
+    return
+}
+
+filter := bson.D{{"username", req.Username}}
+// fetch stored hash, then bcrypt.CompareHashAndPassword(storedHash, []byte(req.Password))
+```
+
+The filter now contains only string literals the driver treats as data values, not operator keys.
+
+### References
+- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/05.6-Testing_for_NoSQL_Injection
+
+---
+
+## Finding 2: Hardcoded Credentials in Source Code
+
+**File:** `main.go`
+**Lines:** 23–29
+**CWE:** CWE-798 — Use of Hard-Coded Credentials
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+users.InsertMany(context.TODO(), []interface{}{
+    bson.M{"username": "admin", "password": "password"},
+    bson.M{"username": "user", "password": "123456"},
+})
+```
+
+### Description
+The plaintext passwords `password` and `123456` for privileged accounts are hardcoded in source code. Anyone with repository read access — including CI/CD systems, contractors, or a leaked repo — immediately knows valid credentials for the `admin` account. Combined with Finding 1, these credentials are also fully bypassed anyway, but even without that finding, hardcoded credentials in version control are a permanent, unrevocable exposure.
+
+### Prioritization
+P2 — second priority. Exploitability is lower than Finding 1 (requires repository access or prior knowledge of these well-known default passwords), but impact is the same: full admin authentication. Fix alongside Finding 3 (both relate to password storage).
+
+### Exploitability Notes
+- **Exploit Preconditions:** Repository read access, or recognition of trivially guessable passwords (`password`, `123456`).
+- **Uncertainty Boundary:** Impact depends on whether these seed accounts exist in production or only in test environments.
+
+**Concrete attacker input:**
+```json
+{"username": "admin", "password": "password"}
+```
+
+**Counterfactual invalidation:** Removing seed credentials from source and provisioning them through a secrets manager (or environment variable at startup) eliminates the hardcoded exposure.
+
+### Remediation
+Provision credentials at deploy time via environment variables or a secrets manager; never commit them:
+
+```go
+// main.go — read from environment, never hardcode
+adminPass := os.Getenv("ADMIN_PASSWORD")
+if adminPass == "" {
+    log.Fatal("ADMIN_PASSWORD must be set")
+}
+hashedAdmin, _ := bcrypt.GenerateFromPassword([]byte(adminPass), 12)
+users.InsertMany(ctx, []interface{}{
+    bson.M{"username": "admin", "password": string(hashedAdmin)},
+})
+```
+
+In `docker-compose.yml` set `ADMIN_PASSWORD` via a secrets backend or `.env` file excluded from version control.
+
+### References
+- https://cwe.mitre.org/data/definitions/798.html
+
+---
+
+## Finding 3: Plaintext Password Storage and Comparison
+
+**File:** `main.go`
+**Lines:** 23–29, 36–43
+**CWE:** CWE-256 — Plaintext Storage of a Password / CWE-916 — Use of Password Hash With Insufficient Computational Effort
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+// Storage (plaintext):
+bson.M{"username": "admin", "password": "password"},
+
+// Comparison (plaintext in MongoDB filter):
+users.FindOne(context.TODO(), creds)
+```
+
+### Description
+Passwords are stored as plaintext strings in MongoDB and verified by including them verbatim in the database query filter. If MongoDB is breached — directly or via the operator injection in Finding 1 — every user's password is immediately readable with zero cracking effort. Plaintext storage also means there is no protection against credential stuffing across services where users reuse passwords. Secure authentication requires a slow adaptive hash (bcrypt, Argon2id) applied before storage; the database should only ever hold hashes.
+
+### Prioritization
+P2 (tied with Finding 2). Both are secondary to the authentication bypass in Finding 1 — Fix 1 first — but these must both be resolved to have any meaningful password security.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Database read access (directly exploitable via Finding 4 — unauthenticated MongoDB port) or exfiltration via Finding 1's operator injection.
+- **Uncertainty Boundary:** None — plaintext storage is confirmed in source.
+
+**Counterfactual invalidation:** Storing passwords as `bcrypt` hashes and performing hash comparison server-side (never in the query) would eliminate the plaintext exposure.
+
+### Remediation
+Hash on write with bcrypt; compare server-side never via query:
+
+```go
+import "golang.org/x/crypto/bcrypt"
+
+// On seed / registration:
+hash, err := bcrypt.GenerateFromPassword([]byte(plainPassword), 12)
+if err != nil { log.Fatal(err) }
+bson.M{"username": "admin", "password": string(hash)}
+
+// On login — query only by username, then compare hash:
+filter := bson.D{{"username", req.Username}}
+var result bson.M
+if err := users.FindOne(ctx, filter).Decode(&result); err != nil {
+    http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+    return
+}
+storedHash := result["password"].(string)
+if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
+    http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+    return
+}
+w.Write([]byte("Login successful"))
+```
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+
+---
+
+## Finding 4: Unauthenticated MongoDB Instance Exposed on Host Network
+
+**File:** `docker-compose.yml`
+**Lines:** 14–20
+**CWE:** CWE-284 — Improper Access Control
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** HIGH
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```yaml
+mongo:
+  image: mongo:5.0
+  container_name: mongodb
+  ports:
+    - "27017:27017"       # published on all host interfaces
+  # no MONGO_INITDB_ROOT_USERNAME / MONGO_INITDB_ROOT_PASSWORD set
+  # no --auth flag → MongoDB starts with no access control
+```
+
+### Description
+MongoDB 5.0 starts without access control when no auth is configured. Combined with `ports: "27017:27017"` binding the port to all host interfaces (`0.0.0.0`), any host that can reach the machine on port 27017 can connect to MongoDB directly — without credentials — and perform arbitrary reads and writes on all collections. An attacker bypassing the application layer entirely can read all user records (usernames + plaintext passwords from Finding 3), insert poisoned documents, or drop collections.
+
+### Prioritization
+P3 — lower than application-layer findings because exploitability depends on whether the host is Internet-facing or inside a private network. Still HIGH severity because successful exploitation gives complete database control without any application-layer interaction.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network reachability to host port 27017. On a cloud VM with a public IP and no firewall this is Internet-exploitable.
+- **Uncertainty Boundary:** If a host firewall blocks inbound 27017, practical exploitability drops to LAN-only or requires prior host compromise. Confidence is MEDIUM for this reason.
+
+**Concrete attacker command:**
+```bash
+mongosh mongodb://<host-ip>:27017/testdb --eval "db.users.find()"
+# Returns all user records including plaintext passwords
+```
+
+**Counterfactual invalidation:** Removing the `ports` stanza from the `mongo` service (keeping MongoDB internal to the Docker network) and adding `MONGO_INITDB_ROOT_USERNAME` / `MONGO_INITDB_ROOT_PASSWORD` to enable access control would remediate this finding.
+
+### Remediation
+Remove the host port binding so MongoDB is only reachable within the Docker network; enable auth:
+
+```yaml
+mongo:
+  image: mongo:5.0
+  container_name: mongodb
+  # Remove ports: stanza — no host binding needed
+  environment:
+    MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+    MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+  volumes:
+    - mongo_data:/data/db
+```
+
+Update the app connection string to include credentials from environment:
+
+```go
+// main.go
+uri := os.Getenv("MONGO_URI") // e.g., mongodb://user:pass@mongo:27017
+client, err = mongo.Connect(ctx, options.Client().ApplyURI(uri))
+```
+
+### References
+- https://www.mongodb.com/docs/manual/administration/security-checklist/
+
+---
+
+## Finding 5: Credentials Transmitted Over Plaintext HTTP
+
+**File:** `main.go`
+**Lines:** 51
+**CWE:** CWE-319 — Cleartext Transmission of Sensitive Information
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P4
+**Severity:** LOW
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```go
+log.Fatal(http.ListenAndServe(":8080", nil))
+```
+
+### Description
+The application serves all traffic — including the login endpoint which receives usernames and passwords — over plain HTTP with no TLS. Any network-adjacent attacker (on-path, shared Wi-Fi, compromised router) can capture credentials in transit via passive interception. The `docker-compose.yml` maps port 8081 directly to this HTTP listener with no TLS-terminating proxy in front.
+
+### Prioritization
+P4 — lowest priority in this report. The other findings enable credential theft without network access at all (NoSQL injection, plaintext storage, direct DB access). Fix those first; TLS adds defense-in-depth after the more critical architectural issues are resolved.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network path between client and server (on-path attacker).
+- **Uncertainty Boundary:** If a TLS-terminating proxy (nginx, Caddy, ALB) sits in front of this container in production, the risk is reduced to the proxy–app segment only.
+
+**Counterfactual invalidation:** Adding a TLS-terminating reverse proxy (nginx with a valid certificate) in front of the Go service and binding the Go service to the Docker-internal network only would remediate this.
+
+### Remediation
+Place a TLS-terminating reverse proxy (e.g., Caddy, nginx) in front of the application and remove the direct host port binding:
+
+```yaml
+# docker-compose.yml
+caddy:
+  image: caddy:2-alpine
+  ports:
+    - "443:443"
+  volumes:
+    - ./Caddyfile:/etc/caddy/Caddyfile
+  depends_on:
+    - app
+
+app:
+  build: .
+  # no host port binding — internal only
+  expose:
+    - "8080"
+```
+
+### References
+- https://owasp.org/www-project-top-ten/2021/A02_2021-Cryptographic_Failures
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 3     |
+| Total Findings  | 5     |
+| Critical        | 1     |
+| High            | 3     |
+| Medium          | 0     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The login endpoint is completely bypassable via MongoDB operator injection with a single unauthenticated
+HTTP request — no credentials, prior access, or complexity required. This is compounded by plaintext
+password storage and a MongoDB instance accessible without authentication directly on the host network,
+meaning an attacker has two independent paths to every user credential before the application logic
+is even involved.
+```
+
+### Prioritization Notes
+Finding 1 (NoSQL injection) is strictly P1: zero preconditions, immediate full auth bypass. Findings 2 and 3 (hardcoded credentials, plaintext storage) are co-P2 and should be remediated together since both require restructuring the password lifecycle. Finding 4 (exposed MongoDB) is P3 because it requires network access but completely sidesteps the application layer. Finding 5 (no TLS) is P4 — lowest exploitability given the other issues present, but should be addressed before any production deployment.

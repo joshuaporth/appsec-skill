@@ -1,0 +1,296 @@
+Now I have everything I need. Let me conduct the full three-pass review.
+
+---
+
+## Pass 1 — Attack Surface
+
+**Language/Framework:** Node.js, Express 4.18.2, body-parser 1.20.2  
+**No `helmet` middleware present.**
+
+**Entry Points:**
+| Route | Method | User Input |
+|---|---|---|
+| `/profile` | GET | None |
+| `/register` | POST | `req.body` (stub — no logic visible) |
+| `/reset-password` | POST | `req.body.email`, `req.headers.host` |
+
+**Sensitive operations:** password reset link construction (line 25), email sending (line 26–31), token generation (line 25).
+
+**Trust boundaries:** `req.headers.host` and `req.body.email` are both fully attacker-controlled.
+
+---
+
+## Pass 2 — Deep Scan + Pass 3 — Validation
+
+---
+
+## Finding 1: Host Header Injection — Password Reset Phishing / Account Takeover
+
+**File:** `main.js`  
+**Lines:** 25  
+**CWE:** CWE-601 — URL Redirection to Untrusted Site ('Open Redirect')  
+**OWASP Category:** A07:2021 – Identification and Authentication Failures  
+**Priority:** P1  
+**Severity:** HIGH  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const resetLink = `http://${req.headers.host}/reset-password?token=generatedToken123`;
+```
+
+### Description
+`req.headers.host` is the verbatim value of the HTTP `Host` request header, which is entirely attacker-controlled. An attacker who wants to steal a victim's account can send:
+
+```http
+POST /reset-password HTTP/1.1
+Host: attacker.example.com
+Content-Type: application/json
+
+{"email": "victim@company.com"}
+```
+
+The application assembles `http://attacker.example.com/reset-password?token=generatedToken123` and emails it to `victim@company.com`. When the victim clicks the link, the reset token is delivered directly to the attacker's server — enabling account takeover without the victim having any obvious indicator of tampering. The legitimate application domain never appears in the reset link.
+
+### Prioritization
+Highest priority. This is a direct, realistic phishing/account-takeover vector with no technical barriers: zero preconditions beyond network access, one HTTP request, and a social-engineering step (victim clicks a link from a legitimate-looking email address).
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker knows a victim's email address; victim clicks the received password reset link.
+- **Uncertainty Boundary:** Impact is confirmed by the code. No runtime/config factors eliminate this path.
+
+### Remediation
+Never derive the application base URL from the inbound `Host` header. Use a server-side configured origin instead:
+
+```javascript
+// In docker-compose.yml or .env
+// APP_BASE_URL=https://app.example.com
+
+app.post('/reset-password', (req, res) => {
+    const baseUrl = process.env.APP_BASE_URL;  // server-controlled, never from request
+    if (!baseUrl) throw new Error('APP_BASE_URL must be configured');
+
+    const token = crypto.randomBytes(32).toString('hex');  // see Finding 2
+    // ... store token in DB with expiry ...
+
+    const resetLink = `${baseUrl}/reset-password?token=${token}`;
+    transporter.sendMail({
+        from: 'support@example.com',
+        to: req.body.email,
+        subject: 'Password Reset',
+        text: `Click here to reset your password: ${resetLink}`
+    });
+    res.send('Password reset link has been sent to your email.');
+});
+```
+
+**Counterfactual invalidation:** If `resetLink` used `process.env.APP_BASE_URL` (a server-controlled value) instead of `req.headers.host`, this finding would not exist.
+
+### References
+- https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/17-Testing_for_Host_Header_Injection
+
+---
+
+## Finding 2: Hardcoded, Non-Random Password Reset Token
+
+**File:** `main.js`  
+**Lines:** 25  
+**CWE:** CWE-330 — Use of Insufficiently Random Values; CWE-798 — Use of Hard-coded Credentials  
+**OWASP Category:** A07:2021 – Identification and Authentication Failures  
+**Priority:** P1  
+**Severity:** HIGH  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const resetLink = `http://${req.headers.host}/reset-password?token=generatedToken123`;
+```
+
+### Description
+The password reset token is the static, hardcoded string `generatedToken123`. Every password reset request for every user at any time produces the same token. This completely breaks the security model: any attacker who reads the source code (or guesses this trivially guessable string) can navigate directly to `/reset-password?token=generatedToken123` and reset any account without receiving the reset email. There is no per-user, per-request entropy, no expiry, and no single-use enforcement visible in this code.
+
+### Prioritization
+Co-equal P1 with Finding 1. The reset mechanism is functionally unauthenticated: knowledge of the hardcoded string substitutes entirely for identity verification. This is immediately exploitable without user interaction, unlike Finding 1.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker reads the source or guesses `generatedToken123`.
+- **Uncertainty Boundary:** If token validation/consumption logic lives in omitted code, single-use enforcement could partially mitigate, but the predictability and hardcoded nature remain a complete failure.
+
+### Remediation
+Generate a cryptographically random token per request using Node's `crypto` module, store it server-side with the target user and an expiry, and invalidate it after first use:
+
+```javascript
+const crypto = require('crypto');
+
+app.post('/reset-password', async (req, res) => {
+    const token = crypto.randomBytes(32).toString('hex'); // 256 bits of entropy
+    const expiry = Date.now() + 60 * 60 * 1000;          // 1-hour TTL
+
+    // Persist: await db.storeResetToken(req.body.email, token, expiry);
+
+    const baseUrl = process.env.APP_BASE_URL;
+    const resetLink = `${baseUrl}/reset-password?token=${token}`;
+    // ...
+});
+```
+
+**Counterfactual invalidation:** Replacing `generatedToken123` with `crypto.randomBytes(32).toString('hex')` and adding server-side token storage/expiry would invalidate this finding.
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html
+- https://nodejs.org/api/crypto.html#cryptorandombytessize-callback
+
+---
+
+## Finding 3: Email Header Injection via Unsanitized `to` Field
+
+**File:** `main.js`  
+**Lines:** 29  
+**CWE:** CWE-93 — Improper Neutralization of CRLF Sequences ('Email Header Injection')  
+**OWASP Category:** A03:2021 – Injection  
+**Priority:** P2  
+**Severity:** HIGH  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+to: req.body.email,
+```
+
+### Description
+`req.body.email` is passed directly into the `to` field of the mail options with no format validation or CRLF sanitization. A real email transport library (as this is documented to represent) interprets CRLF sequences (`\r\n`) in email header fields as new header boundaries. An attacker can inject additional headers by supplying:
+
+```json
+{"email": "victim@example.com\r\nBcc: spam1@evil.com,spam2@evil.com"}
+```
+
+This would cause the application's mail transport to send the password-reset email to the injected `Bcc:` recipients — using the application's trusted sending domain. This enables the application to be weaponized as a spam/phishing relay, and can also be used to silently copy reset emails to an attacker (`Bcc: attacker@evil.com` targeting a real victim's reset).
+
+### Prioritization
+P2, after the two P1 token/URL findings. Exploitation requires the real email transporter to be wired up, and the impact (spam relay, copied emails) is secondary to the account takeover path in Finding 1, but still significant given the app's trusted sender identity.
+
+### Exploitability Notes
+- **Exploit Preconditions:** A real email transporter must be configured (noted as the intended design in the comment on line 7–10).
+- **Uncertainty Boundary:** If the email library internally sanitizes CRLF in recipient addresses, impact is reduced; but relying on undocumented library behavior is unsafe.
+
+### Remediation
+Validate the email address format before use, and ensure the email library rejects or strips CRLF sequences. Use a well-maintained validation library and never trust raw input in transport headers:
+
+```javascript
+const { validate: isEmail } = require('email-validator'); // npm install email-validator
+
+app.post('/reset-password', (req, res) => {
+    const email = req.body.email;
+    if (typeof email !== 'string' || !isEmail(email)) {
+        return res.status(400).send('Invalid email address.');
+    }
+    // email is now a single, structurally valid address
+    transporter.sendMail({ to: email, /* ... */ });
+});
+```
+
+**Counterfactual invalidation:** Strict RFC 5321 format validation that rejects any address containing `\r`, `\n`, or multiple addresses would eliminate the injection path.
+
+### References
+- https://owasp.org/www-community/vulnerabilities/Email_Header_Injection
+- https://cwe.mitre.org/data/definitions/93.html
+
+---
+
+## Finding 4: Missing HTTP Security Headers (No `helmet`)
+
+**File:** `main.js`  
+**Lines:** 1–36  
+**CWE:** CWE-16 — Configuration  
+**OWASP Category:** A05:2021 – Security Misconfiguration  
+**Priority:** P3  
+**Severity:** LOW  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const app = express();
+app.use(bodyParser.json());
+// No helmet() or equivalent security header middleware
+```
+
+### Description
+No `helmet` middleware (or equivalent) is installed. Express does not set protective security headers by default. The application responses therefore lack `X-Content-Type-Options: nosniff`, `X-Frame-Options`, `Content-Security-Policy`, `Referrer-Policy`, and (over HTTPS) `Strict-Transport-Security`. This leaves browsers without standard defenses against MIME-sniffing, clickjacking, and cross-site data leakage.
+
+### Prioritization
+P3. Lower priority than P1/P2 findings; no direct exploitability path without another vulnerability, but straightforward to fix with minimal risk.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires a secondary vulnerability (e.g., reflected XSS) to be meaningful in most cases.
+- **Uncertainty Boundary:** Impact depends on browser behavior and whether other vulnerabilities are present.
+
+### Remediation
+```javascript
+const helmet = require('helmet'); // npm install helmet
+app.use(helmet());
+```
+
+### References
+- https://helmetjs.github.io/
+- https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html
+
+---
+
+## Finding 5: `NODE_ENV=development` in Container Orchestration Config
+
+**File:** `docker-compose.yml`  
+**Lines:** 9  
+**CWE:** CWE-16 — Configuration  
+**OWASP Category:** A05:2021 – Security Misconfiguration  
+**Priority:** P4  
+**Severity:** INFO  
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```yaml
+environment:
+  - NODE_ENV=development
+```
+
+### Description
+The Docker Compose file sets `NODE_ENV=development`, which in many Express-ecosystem libraries enables verbose error output, disables production optimizations, and may expose stack traces in error responses. If this compose file is used in a production-adjacent deployment, the setting propagates into the container and could leak internal implementation details.
+
+### Prioritization
+P4. Informational; this is likely intentional for local dev. Only worth addressing if this compose file is used for staging/production.
+
+### Exploitability Notes
+- **Exploit Preconditions:** This compose file must be used for a non-development deployment.
+- **Uncertainty Boundary:** Impact depends on which libraries respect `NODE_ENV` and what they expose in development mode.
+
+### Remediation
+Use `NODE_ENV=production` in any non-development deployment, or manage this via a separate `docker-compose.prod.yml` override:
+
+```yaml
+environment:
+  - NODE_ENV=production
+```
+
+### References
+- https://expressjs.com/en/advanced/best-practice-performance.html#set-node_env-to-production
+
+---
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 4     |
+| Total Findings  | 5     |
+| Critical        | 0     |
+| High            | 3     |
+| Medium          | 0     |
+| Low             | 1     |
+| Info            | 1     |
+
+### Key Risks
+The password reset endpoint has two compounding P1 issues: the reset link domain is controlled by the attacker via the `Host` header (direct phishing/account-takeover path), and every reset uses the same hardcoded token `generatedToken123` (trivially predictable, no expiry). A third HIGH finding allows the application to be used as an email injection relay. Together these three issues make the password reset feature fully unsafe as written.
+```
+
+### Prioritization Notes
+Findings 1 and 2 are both P1 because each independently breaks the password reset security guarantee — Finding 1 via attacker-controlled delivery destination, Finding 2 via a trivially known token. Finding 3 is P2 because it requires a real mail transport and has a narrower direct impact. All three HIGH findings share a single remediation surface (`/reset-password`) and should be fixed together.

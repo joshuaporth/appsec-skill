@@ -1,0 +1,355 @@
+Now I have everything I need. Conducting the three-pass security review.
+
+---
+
+## Pass 1 — Triage
+
+**Language/Framework:** Java 17, Spring Boot 3.2.5. `spring-security-crypto` is declared in `pom.xml` but **not used**. No `spring-boot-starter-security`, so Spring Security's auto-configuration (CSRF protection, session management, authentication filters) is entirely absent.
+
+**Entry Points:** `POST /register`, `POST /login`, `GET /admin/usernames`
+
+**Sensitive Operations:** password hashing, credential verification, admin data access
+
+---
+
+## Pass 2 — Deep Scan + Pass 3 — Validation
+
+Findings ordered by exploitability and impact:
+
+---
+
+## Finding 1: Missing Function-Level Access Control on Admin Endpoint
+
+**File:** `src/main/java/com/example/demo/main.java`
+**Lines:** 49–52
+**CWE:** CWE-862 — Missing Authorization
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+// retrieving all usernames (simulated admin functionality)
+@GetMapping("/admin/usernames")
+public Map<String, String> getAllUsernames() {
+    return userDatabase;
+}
+```
+
+### Description
+The `/admin/usernames` endpoint has no authentication or authorization check. Any unauthenticated client can issue `GET /admin/usernames` and receive the entire user database, including every registered username and its corresponding (MD5-hashed) password. Because the returned `userDatabase` map contains both usernames as keys and password hashes as values, this endpoint enables mass account enumeration and offline password cracking — especially catastrophic when combined with the MD5 weakness in Finding 2.
+
+### Prioritization
+Highest priority. Zero preconditions; one HTTP request exfiltrates all credentials. The combination of unauthenticated access plus exposed MD5 hashes means a single request suffices to begin cracking every account offline.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 8081; no authentication, no API key, no IP restriction.
+- **Uncertainty Boundary:** If a firewall restricts external access to the port, the attack surface is limited to internal/adjacent-network actors. No such control is visible in the in-scope config.
+
+### Remediation
+Apply Spring Security to gate this endpoint. Add `spring-boot-starter-security` to `pom.xml` and configure role-based access:
+
+```java
+// pom.xml — add this dependency
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+
+// SecurityConfig.java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/admin/**").hasRole("ADMIN")
+                .requestMatchers("/register", "/login").permitAll()
+                .anyRequest().authenticated()
+            )
+            .httpBasic(Customizer.withDefaults()); // or JWT/session
+        return http.build();
+    }
+}
+```
+
+Additionally, the admin response should never return password hashes; return only usernames:
+
+```java
+@GetMapping("/admin/usernames")
+public Set<String> getAllUsernames() {
+    return userDatabase.keySet(); // hashes must never be returned
+}
+```
+
+### References
+- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+- https://cwe.mitre.org/data/definitions/862.html
+
+---
+
+## Finding 2: Weak Password Hashing — MD5 Without Salt
+
+**File:** `src/main/java/com/example/demo/main.java`
+**Lines:** 37–46
+**CWE:** CWE-916 — Use of Password Hash With Insufficient Computational Effort
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+private String hashPassword(String password) {
+    try {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        md.update(password.getBytes());
+        byte[] digest = md.digest();
+        return DatatypeConverter.printHexBinary(digest).toUpperCase();
+    } catch (NoSuchAlgorithmException e) {
+        return "Error: Hashing algorithm not found";
+    }
+}
+```
+
+### Description
+MD5 is a general-purpose cryptographic hash, not a password hashing function. It is critically deficient for password storage on two grounds: (1) No salt is applied — identical passwords produce identical hashes, enabling rainbow-table lookups and revealing shared passwords across users. (2) MD5 is extremely fast — modern GPUs can compute tens of billions of MD5 hashes per second, making brute-force cracking of any hash exfiltrated through Finding 1 nearly instantaneous. Additionally, the `catch` block returns a literal error string — any user registered while hashing fails will have `"Error: Hashing algorithm not found"` stored as their "password hash", which constitutes a logic error in authentication state. Notably, the project's own `pom.xml` already declares `spring-security-crypto`, which ships BCrypt — the fix is already a dependency away.
+
+### Prioritization
+P1, tied with Finding 1. Both must be fixed together; cracking the hashes obtained through Finding 1 is trivially fast with MD5.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker has obtained the hash dump (via Finding 1). Common passwords crack in seconds; GPU clusters can exhaust all 8-character alphanumeric passwords against MD5 in minutes.
+- **Uncertainty Boundary:** None — MD5 unsuitability for passwords is unconditional.
+- **Counterfactual invalidation:** Replacing MD5 with `BCryptPasswordEncoder` (cost ≥ 12) eliminates the cracking risk regardless of hash exposure.
+
+### Remediation
+Use Spring Security's `BCryptPasswordEncoder`, which is already available via the declared `spring-security-crypto` dependency:
+
+```java
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+
+private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder(12);
+
+@PostMapping("/register")
+public String registerUser(@RequestParam String username, @RequestParam String password) {
+    userDatabase.put(username, passwordEncoder.encode(password));
+    return "User registered successfully";
+}
+
+@PostMapping("/login")
+public String loginUser(@RequestParam String username, @RequestParam String password) {
+    String storedHash = userDatabase.get(username);
+    if (storedHash != null && passwordEncoder.matches(password, storedHash)) {
+        return "Login successful";
+    }
+    return "Invalid username or password";
+}
+// The hashPassword() method can be deleted entirely
+```
+
+BCrypt auto-generates a unique salt per password and is intentionally slow (cost factor 12 ≈ 250 ms/hash), making brute-force computationally infeasible.
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+- https://cwe.mitre.org/data/definitions/916.html
+
+---
+
+## Finding 3: No Session or Token Issued on Login — Authentication State Never Established
+
+**File:** `src/main/java/com/example/demo/main.java`
+**Lines:** 28–35
+**CWE:** CWE-306 — Missing Authentication for Critical Function
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+@PostMapping("/login")
+public String loginUser(@RequestParam String username, @RequestParam String password) {
+    String hashedPassword = userDatabase.get(username);
+    if (hashedPassword != null && hashedPassword.equals(hashPassword(password))) {
+        return "Login successful";
+    }
+    return "Invalid username or password";
+}
+```
+
+### Description
+The `/login` endpoint validates credentials but responds only with the plain string `"Login successful"` — it issues no session cookie, no JWT, and no token of any kind. As a result, there is no authenticated state: after a successful login call the user holds no credential that distinguishes them from an anonymous caller. Every endpoint (including `/admin/usernames`) treats every request identically, regardless of whether `/login` was called. The application therefore cannot enforce access control even if it wanted to; the entire authentication surface is security theater.
+
+### Prioritization
+P2. The architectural consequence (no protected endpoints are actually protected) is realized through Finding 1. Fix Finding 1 simultaneously with this finding by adopting proper session or token issuance.
+
+### Exploitability Notes
+- **Exploit Preconditions:** None — the absence of session state is a structural gap, not a precondition.
+- **Uncertainty Boundary:** None visible in scope.
+
+### Remediation
+Issue a session or signed token on successful login. With Spring Security (required for Finding 1), HTTP session-based authentication is built in. Alternatively, issue a JWT:
+
+```java
+// Conceptual — with spring-boot-starter-security session approach
+// Spring Security handles session creation on successful authentication automatically
+// via its UsernamePasswordAuthenticationFilter when properly configured.
+
+// For stateless JWT approach, add jjwt dependency and:
+@PostMapping("/login")
+public ResponseEntity<?> loginUser(@RequestParam String username,
+                                   @RequestParam String password) {
+    String storedHash = userDatabase.get(username);
+    if (storedHash != null && passwordEncoder.matches(password, storedHash)) {
+        String token = Jwts.builder()
+            .setSubject(username)
+            .setExpiration(new Date(System.currentTimeMillis() + 3600_000))
+            .signWith(signingKey, SignatureAlgorithm.HS256)
+            .compact();
+        return ResponseEntity.ok(Map.of("token", token));
+    }
+    return ResponseEntity.status(401).body("Invalid credentials");
+}
+```
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+- https://cwe.mitre.org/data/definitions/306.html
+
+---
+
+## Finding 4: Missing CSRF Protection on State-Changing Endpoints
+
+**File:** `src/main/java/com/example/demo/main.java`; `pom.xml`
+**Lines:** 21–25 (`/register`), 28–35 (`/login`)
+**CWE:** CWE-352 — Cross-Site Request Forgery
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P2
+**Severity:** MEDIUM
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+@PostMapping("/register")
+public String registerUser(@RequestParam String username, @RequestParam String password) {
+    ...
+}
+
+@PostMapping("/login")
+public String loginUser(@RequestParam String username, @RequestParam String password) {
+    ...
+}
+```
+
+### Description
+`spring-boot-starter-security` is absent from `pom.xml`, so Spring Security's CSRF filter is never loaded. Both `POST /register` and `POST /login` accept requests from any origin without a CSRF token. An attacker can host a page with a hidden form that auto-submits to `/register`, silently creating accounts in the application on behalf of visiting users. While `/login` CSRF is less immediately impactful without session state (Finding 3), fixing the session issue without also fixing CSRF would enable login-CSRF attacks that force victims into attacker-controlled accounts.
+
+### Prioritization
+P2. Lower practical impact than Findings 1–3 because the application has no persistent session (making login-CSRF moot until Finding 3 is fixed), but must be remediated in the same pass as the session fix.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker can trick a victim into visiting a malicious page while their browser can reach port 8081.
+- **Uncertainty Boundary:** If `SameSite=Strict` cookies are enforced (not currently applicable since no cookies are set), CSRF would be mitigated. No such control exists now.
+
+### Remediation
+Adding `spring-boot-starter-security` (required for Finding 1) enables CSRF protection by default for all state-changing endpoints. Ensure CSRF is not disabled in the security config:
+
+```java
+// In SecurityConfig.filterChain — do NOT add .csrf(csrf -> csrf.disable())
+// Spring Security 6.x enables CSRF protection by default for session-based apps
+// For stateless JWT APIs, CSRF can be safely disabled only when no cookies carry auth state:
+.csrf(csrf -> csrf.disable()) // ONLY if using stateless JWT with Authorization: Bearer header
+```
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+- https://cwe.mitre.org/data/definitions/352.html
+
+---
+
+## Finding 5: Username Enumeration via Timing Side-Channel
+
+**File:** `src/main/java/com/example/demo/main.java`
+**Lines:** 29–33
+**CWE:** CWE-208 — Observable Timing Discrepancy
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```java
+String hashedPassword = userDatabase.get(username);
+if (hashedPassword != null && hashedPassword.equals(hashPassword(password))) {
+    return "Login successful";
+}
+```
+
+### Description
+The short-circuit `&&` evaluation means: when `username` does not exist, the `hashPassword()` call is skipped and the method returns immediately. When `username` does exist, the code performs an MD5 hash computation before returning. This creates a measurable response-time difference between "user not found" and "user found but wrong password." An attacker can distinguish valid usernames from invalid ones by comparing response latencies at scale, enabling account enumeration without brute-forcing passwords. With MD5 the timing delta is small (microseconds) but detectable across many requests.
+
+### Prioritization
+P3. Lower practical priority than Findings 1–4. Username enumeration matters most when Findings 1 and 2 are fixed (otherwise the attacker can simply dump all usernames directly from `/admin/usernames`).
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access sufficient to measure response timing; statistical analysis across many requests to distinguish signal from noise.
+- **Uncertainty Boundary:** Network jitter may obscure timing differences in production; exploitability depends on deployment latency characteristics.
+
+### Remediation
+Always perform the hash computation regardless of whether the user exists. After adopting BCrypt (Finding 2), call `passwordEncoder.matches()` unconditionally, passing a dummy hash for missing users:
+
+```java
+private static final String DUMMY_HASH =
+    "$2a$12$invalidusernameXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+@PostMapping("/login")
+public String loginUser(@RequestParam String username, @RequestParam String password) {
+    String storedHash = userDatabase.getOrDefault(username, DUMMY_HASH);
+    boolean valid = passwordEncoder.matches(password, storedHash);
+    if (valid && userDatabase.containsKey(username)) {
+        return "Login successful";
+    }
+    return "Invalid username or password";
+}
+```
+
+BCrypt's constant-time comparison via `matches()` also eliminates the `.equals()` short-circuit risk on hash strings.
+
+### References
+- https://cwe.mitre.org/data/definitions/208.html
+- https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html#account-lockout
+
+---
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 4     |
+| Total Findings  | 5     |
+| Critical        | 1     |
+| High            | 2     |
+| Medium          | 1     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The unauthenticated `/admin/usernames` endpoint (Finding 1) combined with MD5 password hashing
+(Finding 2) creates a one-request full credential dump: an attacker fetches all username/hash
+pairs and cracks every account offline in seconds using publicly available MD5 rainbow tables
+or GPU cracking. The login endpoint (Finding 3) issues no session or token, meaning authentication
+produces no enforced state — every endpoint is effectively public regardless of whether any user
+has "logged in."
+```
+
+### Prioritization Notes
+Findings 1 and 2 must be remediated together in the same deployment — fixing the admin endpoint
+without fixing MD5 still exposes crackable hashes if the authorization gate fails; fixing MD5
+without fixing the admin endpoint means stronger hashes are still dumped unauthenticated.
+The `spring-security-crypto` dependency already in `pom.xml` provides BCrypt; adding
+`spring-boot-starter-security` provides the CSRF filter, auth framework, and session management
+— resolving Findings 1, 3, and 4 in a single dependency addition.

@@ -1,0 +1,231 @@
+I have all the information needed. Here is the full security review.
+
+---
+
+## Finding 1: Unsafe Reflection / Arbitrary Class Instantiation
+
+**File:** `src/main/java/com/example/demoapp/Controller.java`
+**Lines:** 18–21
+**CWE:** CWE-470 — Use of Externally-Controlled Input to Select Classes or Code ('Unsafe Reflection')
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+Class<?> clazz = Class.forName(user);
+Method method = clazz.getMethod("sayHello");
+Object instance = clazz.getDeclaredConstructor().newInstance();
+Object result = method.invoke(instance);
+```
+
+### Description
+The `user` query parameter is passed verbatim to `Class.forName()`, loading an arbitrary class from the JVM classpath. The code then instantiates that class via its no-arg constructor and invokes any `sayHello()` method on it. An attacker can immediately escalate privilege by supplying `?user=com.example.demoapp.AdminUser` — demonstrating that the separation between NormalUser and AdminUser is entirely defeated. Beyond the in-repo classes, the Spring Boot fat JAR includes Hibernate, Spring Framework internals, Jackson, and the full JDK, creating a large gadget surface. Any class whose no-arg constructor has side effects (JNDI lookups, file I/O, network connections) or that exposes a `sayHello()` method with harmful behavior is directly weaponizable. The application also includes `spring-boot-starter-data-jpa`, pulling in Hibernate entity machinery and additional class hierarchies that are not visible to this reviewer, compounding the gadget risk.
+
+### Prioritization
+Highest priority. This is the dominant finding in the codebase — direct attacker control over class loading and object instantiation with no authentication, allowlisting, or sanitization whatsoever. All other findings are secondary.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 8081; no authentication required; classpath must contain a class with a no-arg constructor and `sayHello()` method (or a class with harmful constructor side effects). In-repo, `com.example.demoapp.AdminUser` is immediately reachable for privilege escalation.
+- **Uncertainty Boundary:** Full RCE impact depends on which classes with harmful constructor behavior exist in the assembled fat JAR. The reviewer cannot enumerate the full Spring Boot + Hibernate + JDK classpath without a built artifact. Privilege escalation to AdminUser is confirmed without uncertainty.
+
+### Remediation
+Replace dynamic reflection with an explicit allowlist. The `user` parameter should select from a fixed map of permitted implementations — never pass it to `Class.forName()`:
+
+```java
+private static final Map<String, Supplier<String>> ALLOWED_USERS = Map.of(
+    "normal", () -> new NormalUser().sayHello()
+);
+
+@GetMapping("/custom-hello")
+public ResponseEntity<String> customHello(@RequestParam String user) {
+    Supplier<String> handler = ALLOWED_USERS.get(user);
+    if (handler == null) {
+        return ResponseEntity.badRequest().body("Unknown user type");
+    }
+    return ResponseEntity.ok(handler.get());
+}
+```
+
+If polymorphic dispatch is genuinely required, use a Spring `@Component`-registered strategy map or a sealed interface hierarchy — never `Class.forName()` on raw input.
+
+### Counterfactual Invalidation
+If `user` were validated against the `ALLOWED_USERS` key set before any reflection call, this finding would be invalid.
+
+### References
+- https://cwe.mitre.org/data/definitions/470.html
+- https://owasp.org/Top10/A03_2021-Injection/
+
+---
+
+## Finding 2: Missing Authentication on Dangerous Endpoint
+
+**File:** `src/main/java/com/example/demoapp/Controller.java`
+**Lines:** 15–27
+**CWE:** CWE-306 — Missing Authentication for Critical Function
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+@GetMapping("/custom-hello")
+public String customHello(@RequestParam String user) {
+    // No authentication check of any kind
+    Class<?> clazz = Class.forName(user);
+    ...
+}
+```
+
+### Description
+The `/custom-hello` endpoint, which performs arbitrary class loading and instantiation (see Finding 1), is fully unauthenticated. There is no `spring-boot-starter-security` dependency in `pom.xml`, no `@PreAuthorize` annotation, no filter chain, and no session/token check — any anonymous request from anywhere on the network reaches the reflection logic directly. This removes all access barriers from an already-critical vulnerability, meaning zero pre-authentication steps are required for exploitation.
+
+### Prioritization
+Co-priority P1 with Finding 1. This finding is structurally inseparable from Finding 1: the missing authentication is what ensures the arbitrary class loading is exploitable by any attacker, not just authenticated ones. Remediate alongside Finding 1.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 8081 only. No credentials, cookies, tokens, or session state required.
+- **Uncertainty Boundary:** None. The absence of any authentication mechanism is confirmed from the source code and the dependency list.
+
+### Remediation
+Add `spring-boot-starter-security` to `pom.xml` and enforce authentication on sensitive endpoints:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+```
+
+Then configure a `SecurityFilterChain` bean:
+
+```java
+@Bean
+public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/hello").permitAll()
+            .anyRequest().authenticated()
+        )
+        .httpBasic(Customizer.withDefaults()); // or JWT/OAuth2 as appropriate
+    return http.build();
+}
+```
+
+Even after fixing Finding 1 (replacing reflection with an allowlist), authentication should be enforced independently as a defense-in-depth layer.
+
+### References
+- https://cwe.mitre.org/data/definitions/306.html
+- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+
+---
+
+## Finding 3: Information Disclosure via Exception Messages
+
+**File:** `src/main/java/com/example/demoapp/Controller.java`
+**Lines:** 24–26
+**CWE:** CWE-209 — Generation of Error Message Containing Sensitive Information
+**OWASP Category:** A09:2021 – Security Logging and Monitoring Failures
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```java
+} catch (Exception e) {
+    return "Error invoking method: " + e.getMessage();
+}
+```
+
+### Description
+When the reflection operations in `/custom-hello` throw any exception, the raw `Exception.getMessage()` string is returned to the caller. This exposes JVM-internal details: class-not-found messages reveal which fully qualified names were tried (enabling classpath enumeration), `NoSuchMethodException` reveals method signatures, and `InstantiationException` reveals constructor constraints. An attacker can use this oracle to systematically probe the classpath and identify valid gadget classes for escalating Finding 1.
+
+### Prioritization
+P3. This is a low-severity standalone finding, but it materially assists exploitation of the P1 finding above by enabling blind classpath enumeration. Fix after remediating Findings 1 and 2.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 8081; ability to send GET requests with arbitrary `user` values.
+- **Uncertainty Boundary:** The utility of disclosed information depends on how much JVM internals are exposed in specific exception messages, which varies by JDK version.
+
+### Remediation
+Log the exception server-side and return a generic error to the caller:
+
+```java
+} catch (Exception e) {
+    log.warn("customHello dispatch failed for user={}", user, e);
+    return ResponseEntity.badRequest().body("Invalid request");
+}
+```
+
+### References
+- https://cwe.mitre.org/data/definitions/209.html
+
+---
+
+## Finding 4: End-of-Life Spring Boot Version
+
+**File:** `pom.xml`
+**Lines:** 16, 24, 29
+**CWE:** CWE-1104 — Use of Unmaintained Third Party Components
+**OWASP Category:** A06:2021 – Vulnerable and Outdated Components
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```xml
+<version>2.7.0</version> <!-- Define the version of Spring Boot -->
+```
+
+### Description
+Spring Boot 2.7.0 (released May 2022) reached end-of-support in November 2023 and no longer receives security patches. The same pinned version is applied to `spring-boot-starter-web`, `spring-boot-starter-data-jpa`, and the Maven plugin. Known CVEs affecting Spring Boot 2.7.x include issues in the Spring Framework, Tomcat, and transitive dependencies that will not be backported. Running EOL software in production means discovered vulnerabilities remain permanently unpatched.
+
+### Prioritization
+P3. Independent of the critical reflection issue, this is a maintenance risk. Upgrade after addressing the higher-priority findings.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Depends on which specific CVEs apply to the deployed environment; requires network access.
+- **Uncertainty Boundary:** Exact CVE exposure depends on which transitive dependency versions Maven resolves; not determinable without a full dependency tree (`mvn dependency:tree`).
+
+### Remediation
+Upgrade to Spring Boot 3.x (currently 3.4.x as of this review), which is on the active support track and receives security updates:
+
+```xml
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.4.5</version>
+    <relativePath/>
+</parent>
+```
+
+Remove the redundant `<version>` tags from individual dependency declarations — inheriting from the parent BOM is the correct pattern and ensures consistent version management. Note: Spring Boot 3.x requires Java 17+ (already satisfied by the `eclipse-temurin:17` base image) and uses `jakarta.*` namespaces instead of `javax.*`.
+
+### References
+- https://spring.io/projects/spring-boot#support
+- https://cwe.mitre.org/data/definitions/1104.html
+- https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/
+
+---
+
+```
+## Scan Summary
+
+| Metric         | Value |
+|----------------|-------|
+| Files Analyzed | 7     |
+| Total Findings | 4     |
+| Critical       | 1     |
+| High           | 1     |
+| Medium         | 0     |
+| Low            | 2     |
+| Info           | 0     |
+
+### Key Risks
+The dominant risk is the `/custom-hello` endpoint passing an attacker-controlled query parameter directly to `Class.forName()`, enabling arbitrary class loading and instantiation from the fat JAR classpath with zero authentication. This is immediately exploitable for privilege escalation (NormalUser → AdminUser) and carries realistic RCE risk depending on classpath gadget availability. The exception oracle (Finding 3) further assists an attacker in enumerating the classpath to identify usable gadgets.
+```
+
+### Prioritization Notes
+Findings 1 and 2 are both P1 and should be fixed atomically — remediating the reflection without adding authentication still leaves the allowlist-based endpoint exposed, and adding authentication without fixing the reflection leaves a dangerous pattern for any authenticated user. Findings 3 and 4 are follow-on hardening and carry no urgency beyond normal patch cadence.

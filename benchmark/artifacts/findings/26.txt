@@ -1,0 +1,385 @@
+Now I have everything needed for a full three-pass analysis. Let me conduct it on `main.js`.
+
+---
+
+## Pass 1 — Triage
+
+- **Language/Framework:** Node.js, Express 4.21.2, cookie-parser, body-parser
+- **Entry points:** `POST /guest-login`, `POST /update-profile`, `GET /admin`
+- **Trust boundaries:** `req.cookies.username` (unsigned, attacker-controlled), `req.body` (JSON, fully attacker-controlled)
+- **Sensitive operations:** cookie-based auth check (lines 27–30), `merge(user, req.body)` (line 33), `user.isAdmin` gate (line 39)
+- **Dangerous patterns flagged immediately:** `merge()` with `for...in` on user-supplied body; `users[username]` property lookup using attacker-controlled cookie; unsigned cookie with no `signed: true`
+
+---
+
+## Pass 2 — Deep Scan
+
+Three exploitable paths found, ordered by impact.
+
+---
+
+## Pass 3 — Validation
+
+All three paths confirmed reachable with zero preconditions beyond sending an HTTP request. No sanitization or allowlisting present.
+
+---
+
+## Finding 1: Global Prototype Pollution via `__proto__` Cookie Value
+
+**File:** `main.js`  
+**Lines:** 26–35  
+**CWE:** CWE-1321 — Improperly Controlled Modification of Object Prototype Attributes  
+**OWASP Category:** A08:2021 – Software and Data Integrity Failures  
+**Priority:** P1  
+**Severity:** CRITICAL  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.post("/update-profile", (req, res) => {
+    let username = req.cookies.username;
+    if (!username || !users[username]) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    let user = users[username];
+    merge(user, req.body);
+
+    res.json({ message: "Profile updated", user });
+});
+```
+
+### Description
+The guard `!users[username]` is bypassed when `username` is `"__proto__"` because `users["__proto__"]` returns `Object.prototype` itself — a truthy object — so the check evaluates to `false` and execution continues. The subsequent `merge(Object.prototype, req.body)` call writes every property in the attacker-controlled request body directly onto `Object.prototype`, polluting the prototype of every object in the running process. An attacker sends `Cookie: username=__proto__` with body `{"isAdmin": true}`, after which `Object.prototype.isAdmin === true` globally, and any subsequent `GET /admin` request with a valid guest cookie returns `"Welcome, Admin!"`.
+
+### Prioritization
+Highest-priority finding. Exploitation is one unauthenticated HTTP request; impact is process-wide and immediate; no ambiguity in the data flow.
+
+**Counterfactual:** If `users` were created with `Object.create(null)` (null-prototype object), `users["__proto__"]` would not reach `Object.prototype` and this path would be closed.
+
+### Exploitability Notes
+- **Exploit Preconditions:** None beyond HTTP access to `/update-profile`. The cookie is unsigned, so the attacker sets it themselves (no prior login required). Attacker then issues `GET /admin` with any valid username cookie (`guest`) and gains admin access.
+- **Uncertainty Boundary:** None material — the path is fully visible in source. Node.js 18 (confirmed in Dockerfile) preserves this behavior.
+
+**Concrete attacker payload:**
+```
+POST /update-profile HTTP/1.1
+Cookie: username=__proto__
+Content-Type: application/json
+
+{"isAdmin": true}
+```
+Followed by:
+```
+GET /admin HTTP/1.1
+Cookie: username=guest
+```
+→ Response: `Welcome, Admin!`
+
+### Remediation
+```javascript
+// 1. Use a null-prototype object as the user store — severs Object.prototype lookup
+let users = Object.create(null);
+users.guest = { password: "...", profile: "My cool profile" };
+
+// 2. Validate username against a strict allowlist before property access
+const ALLOWED_USERS = new Set(["guest"]); // or load from DB
+app.post("/update-profile", (req, res) => {
+    let username = req.cookies.username;
+    if (!username || !ALLOWED_USERS.has(username) || !users[username]) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+    // ...
+});
+
+// 3. Replace the unsafe merge with an allowlisted field copy (see Finding 2)
+```
+
+### References
+- https://owasp.org/www-community/attacks/Prototype_Pollution
+
+---
+
+## Finding 2: Mass Assignment — Direct Privilege Escalation via `isAdmin`
+
+**File:** `main.js`  
+**Lines:** 14–18, 33  
+**CWE:** CWE-915 — Improperly Controlled Modification of Dynamically-Determined Object Attributes  
+**OWASP Category:** A01:2021 – Broken Access Control  
+**Priority:** P1  
+**Severity:** HIGH  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+function merge(target, source) {
+    for (let key in source) {
+        target[key] = source[key];
+    }
+}
+
+// ...
+    merge(user, req.body);
+```
+
+### Description
+`merge()` copies every key from the attacker-controlled `req.body` into the `user` object with no field allowlist. An authenticated guest can send `{"isAdmin": true}` and the function sets `users["guest"].isAdmin = true` as an own property. The `/admin` route then grants access. A secondary prototype-pollution variant exists within this same function: if the body contains `{"__proto__": {"isAdmin": true}}`, `JSON.parse` creates an own enumerable `"__proto__"` property on the body object, `for...in` iterates it, and `target["__proto__"] = {"isAdmin": true}` invokes the `__proto__` setter, replacing `users.guest`'s prototype and making `users.guest.isAdmin` resolve `true` via the prototype chain. Both variants achieve admin escalation with a single POST.
+
+### Prioritization
+P1, second only to Finding 1 because it requires a valid session cookie (guest login) rather than being zero-auth. However, guest login is a public endpoint with no rate limiting, so the precondition is trivially met.
+
+**Counterfactual:** Replacing `merge` with an allowlisted field copy (`allowedFields = ["profile"]`) eliminates both the mass-assignment and local-prototype-pollution paths through this function.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Must obtain a `guest` session cookie (one call to `POST /guest-login`, publicly accessible).
+- **Uncertainty Boundary:** None — the code is self-contained and the data flow is complete.
+
+**Concrete payloads:**
+
+Direct mass assignment (simplest):
+```
+POST /update-profile HTTP/1.1
+Cookie: username=guest
+Content-Type: application/json
+
+{"isAdmin": true}
+```
+
+Local prototype pollution variant:
+```json
+{"__proto__": {"isAdmin": true}}
+```
+
+### Remediation
+```javascript
+const PROFILE_ALLOWLIST = new Set(["profile"]);
+
+app.post("/update-profile", (req, res) => {
+    let username = req.cookies.username;
+    if (!username || !users[username]) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    let user = users[username];
+    for (const key of PROFILE_ALLOWLIST) {
+        if (Object.prototype.hasOwnProperty.call(req.body, key)) {
+            user[key] = req.body[key];
+        }
+    }
+
+    // Omit security-sensitive fields from the response (see Finding 4)
+    const { password, ...safeUser } = user;
+    res.json({ message: "Profile updated", user: safeUser });
+});
+```
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
+- https://github.com/nicolo-ribaudo/tc39-proposal-json-parsemore
+
+---
+
+## Finding 3: Unsigned Session Cookie Enables Impersonation
+
+**File:** `main.js`  
+**Lines:** 21–24, 27  
+**CWE:** CWE-565 — Reliance on Cookies without Validation and Integrity Checking  
+**OWASP Category:** A07:2021 – Identification and Authentication Failures  
+**Priority:** P2  
+**Severity:** HIGH  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.post("/guest-login", (req, res) => {
+    res.cookie("username", "guest", { httpOnly: true });
+    res.json({ message: "Logged in as guest!" });
+});
+
+app.post("/update-profile", (req, res) => {
+    let username = req.cookies.username;
+```
+
+### Description
+`cookieParser()` is initialized without a secret (line 7), so the `username` cookie is unsigned and carries no integrity guarantee. Any HTTP client can craft `Cookie: username=<arbitrary>` without prior login. While `httpOnly` prevents client-side JavaScript from reading the cookie, it does not stop a server-side crafted request. This is the direct prerequisite for the `__proto__` cookie attack in Finding 1 — an unauthenticated attacker can set `username=__proto__` and trigger global prototype pollution. It also enables impersonation of any known username if additional users are added to the store.
+
+### Prioritization
+P2 because it is a force-multiplier for Finding 1 (which is P1) and represents an independent authentication design failure. Remediate alongside Findings 1 and 2.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Zero — any HTTP client can set arbitrary cookie values.
+- **Uncertainty Boundary:** None — `cookieParser()` without a secret is documented behavior.
+
+### Remediation
+```javascript
+// Initialize cookie-parser with a strong, random secret
+const cookieParser = require("cookie-parser");
+app.use(cookieParser(process.env.COOKIE_SECRET)); // load from env, not hardcoded
+
+// Set cookies as signed
+app.post("/guest-login", (req, res) => {
+    res.cookie("username", "guest", { httpOnly: true, signed: true, sameSite: "Strict" });
+    res.json({ message: "Logged in as guest!" });
+});
+
+// Read from req.signedCookies instead of req.cookies
+app.post("/update-profile", (req, res) => {
+    let username = req.signedCookies.username;
+    // ...
+});
+```
+
+A proper session library (`express-session` with a server-side session store) is preferred over embedding the username in the cookie value.
+
+### References
+- https://expressjs.com/en/api.html#res.cookie (signed option)
+
+---
+
+## Finding 4: Password Returned in API Response Body
+
+**File:** `main.js`  
+**Lines:** 35  
+**CWE:** CWE-200 — Exposure of Sensitive Information to an Unauthorized Actor  
+**OWASP Category:** A02:2021 – Cryptographic Failures / Sensitive Data Exposure  
+**Priority:** P2  
+**Severity:** MEDIUM  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+    res.json({ message: "Profile updated", user });
+```
+
+### Description
+The entire `user` object — including the `password` field — is serialized into the JSON response. Any authenticated guest receives their plaintext password in the response body. Beyond the immediate credential exposure, this pattern scales dangerously: if the user store grows to include token fields, MFA secrets, or password hashes, they are all exposed automatically. In combination with Finding 2, an attacker who just set `isAdmin: true` sees the confirmation that it worked and can observe the full user state.
+
+### Prioritization
+P2. The password is plaintext in the in-memory store (itself a finding in a production context), compounding the impact.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Valid guest session cookie (public endpoint).
+- **Uncertainty Boundary:** None — response serialization is unconditional.
+
+### Remediation
+```javascript
+// Explicitly omit sensitive fields from the response
+const { password, ...safeUser } = user;
+res.json({ message: "Profile updated", user: safeUser });
+```
+
+### References
+- https://owasp.org/Top10/A02_2021-Cryptographic_Failures/
+
+---
+
+## Finding 5: No CSRF Protection on State-Changing Endpoints
+
+**File:** `main.js`  
+**Lines:** 26–35  
+**CWE:** CWE-352 — Cross-Site Request Forgery  
+**OWASP Category:** A01:2021 – Broken Access Control  
+**Priority:** P3  
+**Severity:** MEDIUM  
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```javascript
+app.post("/update-profile", (req, res) => {
+    let username = req.cookies.username;
+    // No CSRF token check
+    merge(user, req.body);
+```
+
+### Description
+Neither `/guest-login` nor `/update-profile` validates a CSRF token. The `username` cookie has no `SameSite` attribute (defaults to `SameSite=Lax` in modern browsers, which blocks cross-site POST from form submissions but not all cross-origin request forms). Since the endpoint requires `Content-Type: application/json`, a naïve cross-origin form POST would fail the preflight check — but an attacker can exploit the browser's handling of `text/plain` CORS exemption to send a body that, after server-side JSON parsing, achieves the desired effect. Combined with a victim who has a valid guest cookie, a malicious page can trigger `/update-profile` cross-origin.
+
+### Prioritization
+P3. Partially mitigated by JSON content-type preflight semantics in modern browsers, but not reliably blocked across all client configurations. Remediate after P1/P2 findings.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Victim must have a valid session cookie and visit attacker-controlled page.
+- **Uncertainty Boundary:** Browser SameSite defaults and preflight handling vary; impact depends on client environment.
+
+### Remediation
+```javascript
+const csrf = require("csurf");
+const csrfProtection = csrf({ cookie: { httpOnly: true, sameSite: "Strict" } });
+
+app.post("/update-profile", csrfProtection, (req, res) => { /* ... */ });
+
+// Also set SameSite on the username cookie:
+res.cookie("username", "guest", { httpOnly: true, signed: true, sameSite: "Strict" });
+```
+
+### References
+- https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+
+---
+
+## Finding 6: Missing Security Headers (No Helmet Middleware)
+
+**File:** `main.js`  
+**Lines:** 1–6  
+**CWE:** CWE-693 — Protection Mechanism Failure  
+**OWASP Category:** A05:2021 – Security Misconfiguration  
+**Priority:** P3  
+**Severity:** LOW  
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const app = express();
+app.use(bodyParser.json());
+app.use(cookieParser());
+// No helmet(), no CSP, no X-Frame-Options, no HSTS
+```
+
+### Description
+The application sets no security-relevant HTTP response headers. Without `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, and `Strict-Transport-Security`, the application is susceptible to MIME sniffing, clickjacking, and downgrade attacks. While none of these directly amplify the findings above, they form part of a complete defense-in-depth posture.
+
+### Prioritization
+P3 — lowest priority; address after exploitable findings are resolved.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Depends on the specific header; most require attacker-controlled content alongside missing protection.
+- **Uncertainty Boundary:** Impact depends on whether TLS termination and CSP are handled at the reverse proxy layer.
+
+### Remediation
+```javascript
+const helmet = require("helmet");
+app.use(helmet()); // sets CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.
+```
+
+### References
+- https://helmetjs.github.io/
+- https://owasp.org/www-project-secure-headers/
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 1     |
+| Total Findings  | 6     |
+| Critical        | 1     |
+| High            | 2     |
+| Medium          | 2     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The `merge()` function combined with unsigned cookies creates two independent paths to full
+admin privilege escalation: (1) an unauthenticated attacker can set Cookie: username=__proto__
+and globally pollute Object.prototype, bypassing the /admin check for all users; (2) any
+authenticated guest can send {"isAdmin": true} in the update-profile body and directly gain
+admin access. These are exploitable with a single HTTP request each and should be remediated
+immediately before any other work.
+```
+
+### Prioritization Notes
+Findings 1 and 2 share the same root cause (`merge()` + unsigned cookie) and must be fixed together — remediating one while leaving the other open still permits admin bypass. Finding 3 (unsigned cookie) is both independently dangerous and a prerequisite for the critical Finding 1 path; fix all three atomically.

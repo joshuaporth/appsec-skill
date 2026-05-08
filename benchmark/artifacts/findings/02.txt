@@ -1,0 +1,238 @@
+Now I'll conduct the full three-pass security analysis on the codebase (Node.js/Express app with axios).
+
+---
+
+## Finding 1: Server-Side Request Forgery (SSRF)
+
+**File:** `main.js`
+**Lines:** 20–27
+**CWE:** CWE-918 — Server-Side Request Forgery (SSRF)
+**OWASP Category:** A10:2021 – Server-Side Request Forgery
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.get('/fetch-data', async (req, res) => {
+    const url = req.query.url;
+    console.log(`Received request for /fetch-data with URL: ${url}`);
+    
+    try {
+        const response = await axios.get(url);
+        res.send(response.data);
+```
+
+### Description
+The `url` query parameter is taken directly from `req.query.url` and passed without any validation or sanitization to `axios.get()`. The full response body is then returned to the caller via `res.send(response.data)`. This is a full-read SSRF: an attacker controls both the destination of the outbound HTTP request and receives the response, enabling them to probe and exfiltrate data from any host reachable by the container — including cloud metadata services (AWS IMDSv1 at `169.254.169.254`, GCP at `169.254.169.254/computeMetadata/v1/`) and internal microservices on the same Docker network. Axios follows HTTP redirects by default, enabling SSRF-via-redirect chains.
+
+### Prioritization
+This is the highest-priority finding in the codebase. It is unauthenticated, directly exploitable with a single HTTP request, and yields full response body access. No preconditions other than network reachability to port 3000.
+
+### Exploitability Notes
+- **Exploit Preconditions:** The endpoint is unauthenticated and exposed on port 3000. Any client reachable to that port can exploit it immediately.
+- **Uncertainty Boundary:** Impact depends on what internal services are co-located in the Docker network and whether IMDSv2 token-gating is enforced on the cloud provider (IMDSv1 is fully exploitable as-is; IMDSv2 requires an additional `PUT` that axios's default `GET` cannot perform — but internal service SSRF remains fully exploitable regardless).
+
+### Remediation
+Implement a strict domain/IP allowlist. Do not attempt to sanitize the URL by blocking keywords — allowlisting is the only safe approach:
+
+```javascript
+const { URL } = require('url');
+
+const ALLOWED_HOSTS = new Set(['api.example.com', 'cdn.example.com']); // populate with legitimate targets
+
+app.get('/fetch-data', async (req, res) => {
+    const rawUrl = req.query.url;
+    let parsed;
+    try {
+        parsed = new URL(rawUrl);
+    } catch {
+        return res.status(400).send('Invalid URL');
+    }
+
+    // Reject non-HTTPS and non-allowlisted hosts
+    if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
+        return res.status(403).send('URL not permitted');
+    }
+
+    // Disable axios redirect following to prevent redirect-based SSRF bypass
+    const response = await axios.get(parsed.toString(), { maxRedirects: 0 });
+    res.send(response.data);
+});
+```
+
+If a dynamic URL target is genuinely required, consider moving the fetch server-side behind an egress proxy with network-level restrictions (block RFC1918, link-local, and loopback ranges at the firewall/security-group layer as defense-in-depth).
+
+### References
+- https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+- https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- https://cwe.mitre.org/data/definitions/918.html
+
+---
+
+## Finding 2: Missing Authentication on Sensitive Endpoint
+
+**File:** `main.js`
+**Lines:** 19–29
+**CWE:** CWE-306 — Missing Authentication for Critical Function
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.get('/fetch-data', async (req, res) => {
+    const url = req.query.url;
+    ...
+    const response = await axios.get(url);
+    res.send(response.data);
+```
+
+### Description
+The `/fetch-data` endpoint — which acts as a full-read outbound HTTP proxy — performs no authentication or authorization check before processing requests. Combined with Finding 1, this means any unauthenticated attacker who can reach port 3000 can immediately exploit the SSRF. Even if the SSRF were partially mitigated (e.g., network-level partial blocking), a proxy endpoint of this nature should be restricted to authenticated and authorized principals, since it amplifies access to network resources beyond those the caller could reach directly.
+
+### Prioritization
+This is a compounding factor that removes any precondition from Finding 1. Addressed second because fixing SSRF (Finding 1) is more impactful, but authentication should be added in parallel.
+
+### Exploitability Notes
+- **Exploit Preconditions:** None beyond network access to port 3000. No session, token, or credential is required.
+- **Uncertainty Boundary:** None — the route handler contains no conditional auth check of any kind.
+
+### Remediation
+Add authentication middleware before sensitive routes. Example using a bearer token (substitute with your actual auth framework — JWT, session, OAuth):
+
+```javascript
+function requireAuth(req, res, next) {
+    const auth = req.headers['authorization'];
+    if (!auth || !isValidToken(auth)) {        // replace with real token verification
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+}
+
+app.get('/fetch-data', requireAuth, async (req, res) => {
+    // ... handler
+});
+```
+
+### References
+- https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
+- https://cwe.mitre.org/data/definitions/306.html
+
+---
+
+## Finding 3: Sensitive Data Exposure via Server Logs
+
+**File:** `main.js`
+**Lines:** 22, 27
+**CWE:** CWE-532 — Insertion of Sensitive Information into Log File
+**OWASP Category:** A09:2021 – Security Logging and Monitoring Failures
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+console.log(`Received request for /fetch-data with URL: ${url}`);
+...
+console.error(`Error fetching data from URL: ${url}`, error);
+```
+
+### Description
+The full user-supplied `url` value is written to server logs unconditionally, including any query parameters embedded in it. If callers (legitimate or attacker) pass URLs containing authentication tokens, API keys, or internal path information (e.g., `http://internal-api/endpoint?token=SECRET`), those values are persisted in logs. The error branch also dumps the complete `error` object, which may include full HTTP response bodies, stack traces, or internal host addresses from failed connection attempts — all useful to an attacker with log access or a defender reviewing logs for sensitive-data exposure.
+
+### Prioritization
+Lower priority than Findings 1 and 2. Exploitability requires either log access (a separate privilege) or SSRF exploitation to recover internal URLs. Remediate after the proxy and auth issues.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires read access to application logs, or awareness that sensitive URLs are being leaked.
+- **Uncertainty Boundary:** Severity scales with what is stored in logs and who has access to them (syslog, SIEM, third-party log aggregation).
+
+### Remediation
+Log a sanitized representation that strips query parameters, and avoid logging the full error object — extract only the message:
+
+```javascript
+const { URL } = require('url');
+
+function safeLogUrl(raw) {
+    try {
+        const u = new URL(raw);
+        return `${u.protocol}//${u.hostname}${u.pathname}`; // omit query string
+    } catch {
+        return '[invalid url]';
+    }
+}
+
+console.log(`Received request for /fetch-data with URL: ${safeLogUrl(url)}`);
+// ...
+console.error(`Error fetching data from URL: ${safeLogUrl(url)} — ${error.message}`);
+```
+
+### References
+- https://cwe.mitre.org/data/definitions/532.html
+- https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/
+
+---
+
+## Finding 4: Missing HTTP Security Headers (No Helmet)
+
+**File:** `main.js`
+**Lines:** 1–4
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** INFO
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const express = require('express');
+const axios = require('axios');
+
+const app = express();
+```
+
+### Description
+The application uses Express without the `helmet` middleware, so all default Express responses lack the security headers that browsers rely on for defense-in-depth: no `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, or `Content-Security-Policy`. While this application currently returns JSON and proxied data (not HTML), the absence of these headers is a hygiene issue that would become exploitable if HTML rendering is added, and `X-Content-Type-Options: nosniff` is relevant even for JSON responses on older browsers.
+
+### Prioritization
+Lowest priority — no direct exploitability in the current codebase. Remediate after the critical SSRF and auth issues.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires additional attack surface (HTML rendering) or browser interaction that doesn't exist in the current routes.
+- **Uncertainty Boundary:** Negligible impact on a pure-JSON API; higher if the app grows to serve HTML.
+
+### Remediation
+```javascript
+const helmet = require('helmet');
+// npm install helmet
+
+const app = express();
+app.use(helmet()); // sets X-Content-Type-Options, X-Frame-Options, HSTS, CSP, etc.
+```
+
+### References
+- https://helmetjs.github.io/
+- https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
+
+---
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 3     |
+| Total Findings  | 4     |
+| Critical        | 1     |
+| High            | 1     |
+| Medium          | 0     |
+| Low             | 1     |
+| Info            | 1     |
+
+### Key Risks
+The dominant risk is a completely unauthenticated full-read SSRF (Finding 1): a single HTTP request to `GET /fetch-data?url=http://169.254.169.254/latest/meta-data/...` can exfiltrate cloud instance credentials with no preconditions. Finding 2 (no authentication) removes any barrier to exploitation and must be addressed in parallel. Together, these two findings represent an immediately weaponizable path from the public internet to internal infrastructure.
+```
+
+**Prioritization Notes:** Findings are ordered by practical exploitability and impact. The SSRF (P1) is the only finding that enables direct infrastructure compromise and must be remediated first — an allowlist-based URL control is the minimum viable fix. Missing auth (P2) should ship in the same change. Log sanitization (P3) and helmet (P3) can follow in a housekeeping pass.

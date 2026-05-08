@@ -1,0 +1,18 @@
+# Benchmark / challenge integrity — keep spoilers out of Cursor index (semantic search,
+# @codebase, etc.). Protocol details: BENCHMARK.md
+
+# Suite-level answer key (numbered vulnerability list).
+benchmark/challenges/README.md
+
+# Published solution files per challenge.
+benchmark/challenges/**/solution*
+
+# PoC / walkthrough artifacts (basenames starting with exploit).
+benchmark/challenges/**/exploit*
+
+# PoC filenames that include "exploit" but do not start with it (e.g. cors-exploit.html).
+benchmark/challenges/**/*exploit*
+
+# Reference "safe" implementations shipped with challenges (not part of blind review).
+benchmark/challenges/**/safe*
+benchmark/challenges/**/Safe*
