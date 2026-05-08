@@ -1,0 +1,224 @@
+Now I have everything I need. Let me perform the full three-pass analysis.
+
+---
+
+## Pass 1 — Triage
+
+**Language/Framework:** Nginx configuration
+**Entry points:**
+- HTTP requests on port 80 for `another-awesome-challenge.com`
+- `location /backend` — reverse proxy to `http://backend/`
+- `location /html` — static file serving via `alias /usr/share/nginx/html/`
+
+**Trust boundaries:** All incoming HTTP request URIs are fully attacker-controlled.
+**Sensitive operations:** Static file serving (`alias`), proxy forwarding, plain HTTP transport.
+
+---
+
+## Pass 2 + 3 — Vulnerabilities
+
+---
+
+## Finding 1: Path Traversal via Nginx Alias Misconfiguration
+
+**File:** `nginx.conf`
+**Lines:** 9–11
+**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```nginx
+location /html {
+    alias /usr/share/nginx/html/;
+}
+```
+
+### Description
+The `location /html` block (no trailing slash) paired with `alias /usr/share/nginx/html/` (with trailing slash) is a textbook Nginx alias path traversal misconfiguration. When Nginx matches `location /html`, it strips the prefix `/html` and appends the remainder to the alias base. Because there is no trailing slash on the location, a request like `GET /html../../../../etc/passwd` strips `/html`, leaving `../../../../etc/passwd`, which is concatenated to `/usr/share/nginx/html/`, yielding `/usr/share/nginx/html/../../../../etc/passwd` → `/etc/passwd` after Nginx normalizes `..` segments. This allows an unauthenticated attacker to read any file on the filesystem accessible to the Nginx worker process.
+
+### Prioritization
+This is the top-priority finding. It is directly exploitable with a single crafted request, requires no authentication, and can leak private keys, credentials in configuration files, `/etc/shadow`, or application source code. No other finding has a shorter exploit path or broader impact.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must be able to send HTTP requests to port 80. No authentication required.
+- **Concrete payload:** `GET /html../../../../etc/passwd HTTP/1.1\r\nHost: another-awesome-challenge.com`
+- **Uncertainty Boundary:** Exact file reach depends on Nginx worker process user (`nginx`, `www-data`, etc.) and filesystem permissions. The traversal itself is not version-dependent — this affects all current Nginx versions under this configuration pattern.
+
+**Counterfactual:** Adding a trailing slash to the location (`location /html/`) would eliminate this vulnerability; the remainder after stripping the prefix would always begin with `/`, making `..` traversal impossible without first going through the intended directory.
+
+### Remediation
+Add a trailing slash to the `location` directive so that the location prefix and alias base both end consistently:
+
+```nginx
+# Before — vulnerable
+location /html {
+    alias /usr/share/nginx/html/;
+}
+
+# After — safe
+location /html/ {
+    alias /usr/share/nginx/html/;
+}
+# Why: requiring the trailing slash forces path remainder to begin with '/',
+# preventing any ../ sequence from escaping the intended directory before
+# the first path component is consumed.
+```
+
+Alternatively, use `root` instead of `alias` (path math is simpler and avoids this class of bug entirely):
+
+```nginx
+location /html/ {
+    root /usr/share/nginx/;
+}
+```
+
+### References
+- https://www.nginx.com/resources/wiki/start/topics/tutorials/config_pitfalls/#alias-in-location
+- https://cwe.mitre.org/data/definitions/22.html
+
+---
+
+## Finding 2: Cleartext HTTP — No TLS
+
+**File:** `nginx.conf`
+**Lines:** 2
+**CWE:** CWE-319 — Cleartext Transmission of Sensitive Information
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```nginx
+listen 80;
+```
+
+### Description
+The server listens exclusively on port 80 with no TLS configuration and no HTTPS redirect. All HTTP traffic — including any cookies, authorization headers, session tokens, form submissions, and API responses proxied from the backend — is transmitted in cleartext. A network-positioned attacker (on-path, same network segment, or at a malicious ISP) can passively intercept all content, strip cookies, or perform active injection to manipulate responses or insert malicious payloads.
+
+### Prioritization
+P2 behind the alias path traversal (which is directly and immediately exploitable by any remote attacker with no preconditions). TLS absence requires a network-positioned attacker, which is a weaker precondition but still broadly exploitable on shared or hostile network segments.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must be on-path (same LAN, compromised router, malicious ISP, or ARP/DNS spoofing).
+- **Uncertainty Boundary:** Impact depends on whether sensitive data (credentials, tokens, PII) actually transits this interface. The backend proxy also runs over HTTP (`http://backend/`), so even adding frontend TLS would leave backend communication unencrypted in transit.
+
+**Counterfactual:** Adding an SSL server block on port 443 with a valid certificate and redirecting port 80 to HTTPS would eliminate this finding.
+
+### Remediation
+```nginx
+server {
+    listen 80;
+    server_name another-awesome-challenge.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name another-awesome-challenge.com;
+
+    ssl_certificate     /etc/ssl/certs/another-awesome-challenge.com.crt;
+    ssl_certificate_key /etc/ssl/private/another-awesome-challenge.com.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    location /backend {
+        proxy_pass http://backend/;
+    }
+
+    location /html/ {
+        alias /usr/share/nginx/html/;
+    }
+}
+```
+
+### References
+- https://owasp.org/Top10/A02_2021-Cryptographic_Failures/
+- https://cwe.mitre.org/data/definitions/319.html
+
+---
+
+## Finding 3: Missing HTTP Security Response Headers
+
+**File:** `nginx.conf`
+**Lines:** 1–12
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```nginx
+server {
+    listen 80;
+    server_name another-awesome-challenge.com;
+    # No add_header directives anywhere in the config
+    # No server_tokens off;
+}
+```
+
+### Description
+The configuration sets no HTTP security response headers and does not suppress the Nginx version banner (`server_tokens` defaults to `on`). Absent headers include `X-Content-Type-Options` (enables MIME-sniffing attacks), `X-Frame-Options` / `Content-Security-Policy frame-ancestors` (enables clickjacking), `Content-Security-Policy` (no XSS mitigation), and `Referrer-Policy`. The Nginx version string in `Server:` responses aids attacker fingerprinting and targeted vulnerability selection. None of these individually constitute a primary attack vector, but their absence removes multiple defensive layers.
+
+### Prioritization
+P3 — lower priority than path traversal and missing TLS. These are defense-in-depth controls; fixing Findings 1 and 2 first will provide much greater security benefit.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Varies by header. Clickjacking requires a separate malicious page; MIME sniffing requires the server to serve attacker-influenced content with wrong content types.
+- **Uncertainty Boundary:** Impact depends on what content is served from `/html`. If only static assets with well-defined content types are served, MIME sniffing risk is lower.
+
+**Counterfactual:** Adding `add_header X-Content-Type-Options "nosniff" always;` and `server_tokens off;` at minimum would remove the easiest-to-exploit issues in this class.
+
+### Remediation
+```nginx
+server {
+    server_tokens off;  # suppress Nginx version from Server header
+
+    # ... existing config ...
+
+    add_header X-Content-Type-Options   "nosniff"           always;
+    add_header X-Frame-Options          "SAMEORIGIN"        always;
+    add_header Referrer-Policy          "no-referrer-when-downgrade" always;
+    # Add after TLS is configured:
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy  "default-src 'self'" always;
+}
+```
+
+### References
+- https://owasp.org/www-project-secure-headers/
+- https://cwe.mitre.org/data/definitions/693.html
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 1     |
+| Total Findings  | 3     |
+| Critical        | 0     |
+| High            | 2     |
+| Medium          | 0     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The alias path traversal (Finding 1) is the most urgent issue — a single unauthenticated HTTP
+request can read arbitrary files accessible to the Nginx worker, including private keys and
+credentials. The absence of TLS (Finding 2) means all traffic is interceptable in plaintext,
+compounding any credential or token exposure. Together these two issues on a public-facing
+server represent a significant breach risk.
+```
+
+### Prioritization Notes
+Findings are ordered by exploitability and impact: Finding 1 (path traversal) requires only an HTTP request and yields arbitrary file read; Finding 2 (no TLS) requires a network-positioned attacker but affects all traffic; Finding 3 (missing headers) requires secondary conditions and is a defense-in-depth gap rather than a primary exploit path.
