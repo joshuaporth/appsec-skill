@@ -1,0 +1,5 @@
+Challenge: 11
+Primary intended issue: Nginx and Flask disagree on which non-ASCII path characters (e.g. `\x85`, `\xa0`) are valid, so a request to `/admin\x85` passes Nginx's `location = /admin` deny rule but Flask normalizes it and serves `/admin` — a path-normalization bypass.
+Verdict: incorrect
+Rationale: The findings never identify or mention the character-normalization mismatch between Nginx and Flask; the primary finding (F1) centers on the docker-compose port-5000 exposure, and F2 addresses only the trailing-slash bypass — neither of which is the intended path-normalization vulnerability.
+Bonus findings: The direct Flask port exposure (docker-compose `ports: "5000:5000"`) and the missing application-layer auth are valid secondary observations.

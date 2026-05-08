@@ -1,0 +1,5 @@
+Challenge: 09
+Primary intended issue: The app implements authentication but no authorization, allowing any logged-in user to edit any other user's profile (IDOR / missing object-level authorization).
+Verdict: correct
+Rationale: Finding 2 in the findings artifact precisely identifies the IDOR — username sourced from `request.form` rather than the session, with a tautological ownership check — which is exactly the intended vulnerability described in the solution.
+Bonus findings: Missing authentication stub (F1), CSRF (F3), XSS (F4), development-mode misconfiguration (F5), and container-runs-as-root (F6) are all valid additional observations.

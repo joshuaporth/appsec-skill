@@ -1,0 +1,5 @@
+Challenge: 27
+Primary intended issue: Integer overflow when quantity exceeds INT_MAX causes the total price to wrap to a negative value, allowing a user to appear owed money instead of charged.
+Verdict: correct
+Rationale: Finding 1 in the frozen artifact precisely identifies the signed integer overflow at the unsigned→signed cast, demonstrates the exact exploit input (`2147483648`) producing `-2147483648 euros`, and recommends boundary checking — all fully aligned with the solution's described vulnerability and remediation.
+Bonus findings: Valid secondary findings on `strtoul` truncation (Finding 2) and missing `endptr` validation (Finding 3) are legitimate and additive.

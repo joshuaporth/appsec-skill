@@ -1,0 +1,5 @@
+Challenge: 10
+Primary intended issue: JWT signature is not verified, allowing an attacker to alter token claims (e.g., change `username` to `"admin"`) and bypass authentication.
+Verdict: correct
+Rationale: The findings identify this exact issue as Finding 1 (Critical/P1), correctly pointing to `jwt.decode()` being used instead of `jwt.verify()` at line 16, and demonstrates a concrete exploit forging an admin token — fully matching the solution's intended primary issue.
+Bonus findings: Valid secondary issues noted: null dereference on malformed tokens (CWE-476) and missing HTTP security headers (CWE-693).

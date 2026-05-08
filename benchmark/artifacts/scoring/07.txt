@@ -1,0 +1,5 @@
+Challenge: 07
+Primary intended issue: Host Header Injection in password reset link construction, where `req.headers.host` is attacker-controlled and used to build the reset URL, enabling phishing or account takeover.
+Verdict: correct
+Rationale: Finding 1 in the findings artifact precisely identifies the Host Header Injection on line 25 of `main.js`, correctly explains the exploit mechanism (attacker-controlled `Host` header redirecting reset link to an attacker domain), and recommends the same remediation (hardcode/env-var the base URL) as the solution material.
+Bonus findings: Valid secondary issues identified — hardcoded token (`generatedToken123`), email header injection, missing security headers, and `NODE_ENV=development` in Docker config.

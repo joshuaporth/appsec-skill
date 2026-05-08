@@ -1,0 +1,5 @@
+Challenge: 24
+Primary intended issue: User-uploaded XSLT files are passed directly to a Saxon XSLT 3.0 processor without restriction, enabling arbitrary local file reads via `unparsed-text()` and similar XSLT functions.
+Verdict: correct
+Rationale: The findings precisely identify the XSLT injection vulnerability, demonstrate exploitation via `unparsed-text('file:///etc/passwd')`, and align with the solution's core concern about unsandboxed user-supplied XSLT enabling arbitrary file reads.
+Bonus findings: Valid extras include missing authentication (CWE-306), error detail disclosure (CWE-209), and CSRF (CWE-352).

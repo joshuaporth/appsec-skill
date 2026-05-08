@@ -1,0 +1,5 @@
+Challenge: 28
+Primary intended issue: Web Cache Deception attack combining Nginx's extension-based cache rule with Express's `/profile*` wildcard route, allowing an attacker to steal authenticated users' API keys from cache without authentication.
+Verdict: correct
+Rationale: The findings precisely identify and explain the Web Cache Deception vulnerability — the interaction between `nginx.conf`'s static-file cache rule and the `/profile*` wildcard in `main.js` — with a correct attack sequence, root cause analysis, and matching remediations (remove the wildcard, add `Cache-Control: no-store`, scope Nginx cache to static paths), all fully aligned with the authoritative solution.
+Bonus findings: Hardcoded plaintext credentials/API key, hardcoded session secret, session fixation on login, and missing security headers — all valid secondary issues.

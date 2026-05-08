@@ -1,0 +1,5 @@
+Challenge: 08
+Primary intended issue: Nginx `alias` path traversal (LFI) caused by missing trailing slash on the `location /html` directive, allowing attackers to escape the designated directory and read arbitrary files.
+Verdict: correct
+Rationale: Finding 1 in the frozen artifact precisely identifies the same `location /html` / `alias` trailing-slash mismatch described in the solution, correctly explains the traversal mechanic (stripping `/html` and concatenating `..` sequences), and provides the matching fix of adding a trailing slash (or switching to `root`).
+Bonus findings: Valid secondary findings for cleartext HTTP (no TLS) and missing security response headers — neither penalized nor required by the primary issue.
