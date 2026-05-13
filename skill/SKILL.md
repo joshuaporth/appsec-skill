@@ -1,5 +1,7 @@
 ---
 name: appsec
+version: 0.2.0
+spec_version: 1
 description: >-
   Performs senior-grade application security code review: three-pass methodology,
   OWASP/CWE-oriented vulnerability analysis, language-specific dangerous patterns,
