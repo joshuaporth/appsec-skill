@@ -1,0 +1,5 @@
+Challenge: 02
+Primary intended issue: Server-Side Request Forgery (SSRF) via unvalidated user-controlled URL passed to `axios.get()` in the `/fetch-data` endpoint.
+Verdict: correct
+Rationale: The findings correctly identify the SSRF as the top-priority critical issue, accurately describe the vulnerable pattern (unsanitized `req.query.url` passed directly to `axios.get()`), and recommend the same allowlist-based remediation the solution prescribes.
+Bonus findings: Missing authentication (CWE-306), sensitive data in logs (CWE-532), and missing HTTP security headers (helmet) — all plausible secondary concerns.

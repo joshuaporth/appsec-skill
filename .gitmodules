@@ -1,0 +1,3 @@
+[submodule "benchmark/challenges"]
+	path = benchmark/challenges
+	url = git@github.com:dub-flow/secure-code-review-challenges.git

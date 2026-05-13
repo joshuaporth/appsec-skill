@@ -1,0 +1,241 @@
+---
+
+## Finding 1: HTTP Response Splitting / Header Injection
+
+**File:** `nginx.conf`
+**Lines:** 14–16
+**CWE:** CWE-113 — Improper Neutralization of CRLF Sequences in HTTP Headers
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```nginx
+location /payment {
+    return 302 http://payment-api$uri;
+}
+```
+
+### Description
+Nginx's `$uri` variable holds the **decoded, normalized** request URI. By embedding `$uri` directly into the `Location` header of a `302` redirect, an attacker can supply percent-encoded CRLF sequences (`%0d%0a`) in the request path. If Nginx decodes these before constructing the response header — a behavior that has been present in various Nginx releases — the HTTP response is split and arbitrary headers (e.g., `Set-Cookie`, `Content-Type`) are injected into the response. A concrete attacker payload is:
+
+```
+GET /payment%0d%0aSet-Cookie:%20session=attacker_value HTTP/1.1
+Host: example.com
+```
+
+On a vulnerable Nginx version this emits:
+```
+HTTP/1.1 302 Found
+Location: http://payment-api/payment
+Set-Cookie: session=attacker_value
+```
+
+Impact includes session fixation, cache poisoning, and downstream XSS if the injected header can serve attacker-controlled content.
+
+### Prioritization
+This is the highest-priority finding because the sink (the raw `Location` header value) is directly attacker-controlled via `$uri`, and the class of attack (HTTP response splitting) has established exploit chains. The only uncertainty is the exact Nginx runtime version's tolerance for CRLF in `return` URL arguments.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker can send an HTTP request to port 80; Nginx version must decode `%0d%0a` within `$uri` before header emission (behavior documented in several Nginx releases; the unpinned `image: nginx` could be any version).
+- **Uncertainty Boundary:** Modern Nginx (≥1.1.x) may reject CRLF in `return` URL arguments — exact protection depends on the resolved `nginx:latest` tag. If the currently deployed image sanitizes CRLF at this stage, exploitation requires a bypass technique.
+
+### Remediation
+Replace `$uri` with a **fixed redirect target** that carries no attacker-controlled content, or use a strict allowlist so only `/payment` itself redirects:
+
+```nginx
+location = /payment {
+    # Fixed target — no attacker-controlled variable in the Location value.
+    return 302 http://payment-api/payment;
+}
+```
+
+If the trailing path must be forwarded, use `$request_uri` with an explicit sanitization filter or proxy the request instead:
+
+```nginx
+location /payment {
+    # Forward internally rather than issuing a client redirect containing user input.
+    proxy_pass http://payment-api;
+}
+```
+
+**Why:** Removing `$uri` from the redirect URL eliminates the attacker-controlled sink entirely. `proxy_pass` lets Nginx forward without constructing an attacker-influenced `Location` header.
+
+### References
+- [CWE-113: Improper Neutralization of CRLF Sequences in HTTP Headers](https://cwe.mitre.org/data/definitions/113.html)
+- [OWASP HTTP Response Splitting](https://owasp.org/www-community/attacks/HTTP_Response_Splitting)
+
+---
+
+## Finding 2: Flask Development Server Directly Exposed — Nginx Controls Bypassable
+
+**File:** `docker-compose.yml`
+**Lines:** 6–7
+**CWE:** CWE-284 — Improper Access Control
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P2
+**Severity:** MEDIUM
+**Confidence:** HIGH
+
+### Vulnerable Code
+```yaml
+flask-app:
+  build: .
+  ports:
+    - "5000:5000"
+```
+
+### Description
+The Flask application's port 5000 is bound directly to the host's network interface alongside the Nginx proxy on port 80. Any request destined for Flask can reach it on port 5000 without traversing Nginx at all. This means every security control enforced at the Nginx layer — rate limiting, IP allowlisting, the `/payment` redirect logic, future WAF rules — is completely bypassable. An attacker who identifies port 5000 can interact with the application backend as if Nginx did not exist.
+
+### Prioritization
+Second priority. The Flask app currently exposes only a trivial `Hello World!` route, limiting immediate impact, but this architectural flaw means any future sensitive route added to Flask inherits the bypass automatically, making it a systemic risk.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Port 5000 must be reachable from the attacker's network (this depends on firewall rules at the host level; the compose config itself exposes it unconditionally).
+- **Uncertainty Boundary:** If a firewall blocks port 5000 externally, the bypass is only intra-host. The compose file itself provides no such firewall.
+
+### Remediation
+Remove the host port binding for the Flask service. Let Flask communicate only on the internal Docker network, so Nginx is the sole ingress:
+
+```yaml
+flask-app:
+  build: .
+  # Remove "ports:" entirely — Flask is reachable from Nginx via app-network
+  networks:
+    - app-network
+```
+
+Nginx can still reach Flask at `http://flask-app:5000` using the Docker service name as hostname (replacing `host.docker.internal`):
+
+```nginx
+location / {
+    proxy_pass http://flask-app:5000;
+}
+```
+
+**Why:** Removing the host port binding means Flask is only addressable on the private `app-network` bridge, enforcing Nginx as the single entry point.
+
+### References
+- [Docker — Networking in Compose](https://docs.docker.com/compose/networking/)
+- [CWE-284: Improper Access Control](https://cwe.mitre.org/data/definitions/284.html)
+
+---
+
+## Finding 3: Entire Host Project Directory Mounted Into Container
+
+**File:** `docker-compose.yml`
+**Lines:** 10–11
+**CWE:** CWE-552 — Files or Directories Accessible to External Parties
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```yaml
+volumes:
+  - .:/app  # Mount your local directory into the container so that live changes are detected
+```
+
+### Description
+The bind mount `.:/app` maps the entire host project directory — including any `.env` files, credentials, SSH keys, or other sensitive files present alongside the application code — into the container's `/app` directory with read-write access. If a path traversal or arbitrary file read vulnerability is introduced into the Flask application, an attacker could read any file from the host directory via the container. Additionally, because the mount is writable, a compromised container process can modify host files, including `Dockerfile`, `nginx.conf`, and `main.py` itself, potentially creating a persistent backdoor.
+
+### Prioritization
+Third priority. The current Flask application has no file-serving routes, so exploitation requires a future vulnerability to chain with. Flagged because the configuration establishes a latent blast-radius amplification for any future finding.
+
+### Exploitability Notes
+- **Exploit Preconditions:** A second vulnerability (path traversal, arbitrary file read, or RCE) must exist in the Flask application to exploit the broad mount.
+- **Uncertainty Boundary:** Impact depends on what sensitive files reside in the host project directory at deploy time.
+
+### Remediation
+Mount only the application source directory, read-only, or eliminate the volume entirely for production images where live-reload is unnecessary:
+
+```yaml
+volumes:
+  - ./main.py:/app/main.py:ro   # mount only what the app needs, read-only
+```
+
+Or, for production, bake the code into the image at build time (the Dockerfile already does `COPY . /app/`) and remove the volume entirely:
+
+```yaml
+flask-app:
+  build: .
+  # No volumes: section — code comes from the Docker image
+```
+
+**Why:** Removing or scoping the bind mount limits what a compromised container process can read or write on the host.
+
+### References
+- [CWE-552: Files or Directories Accessible to External Parties](https://cwe.mitre.org/data/definitions/552.html)
+- [Docker — Use Volumes (security notes)](https://docs.docker.com/storage/volumes/)
+
+---
+
+## Finding 4: Unpinned Nginx Docker Image
+
+**File:** `docker-compose.yml`
+**Lines:** 13
+**CWE:** CWE-1104 — Use of Unmaintained Third-Party Components
+**OWASP Category:** A06:2021 – Vulnerable and Outdated Components
+**Priority:** P4
+**Severity:** INFO
+**Confidence:** HIGH
+
+### Vulnerable Code
+```yaml
+nginx:
+  image: nginx
+```
+
+### Description
+The `nginx` image tag resolves to `nginx:latest`, which is a floating tag that changes with every upstream Nginx release. Any future `docker pull` or `docker-compose pull` silently upgrades (or downgrades) the Nginx version, changing security patching status, TLS defaults, and behavior for edge cases like CRLF handling in `return` directives — the exact runtime factor on which the confidence of Finding 1 depends.
+
+### Prioritization
+Lowest priority; no direct exploitability on its own. However, this is a necessary condition for non-deterministic reproducibility and makes the exploitability uncertainty in Finding 1 unresolvable without pinning.
+
+### Exploitability Notes
+- **Exploit Preconditions:** N/A — this is a configuration hygiene issue, not directly exploitable.
+- **Uncertainty Boundary:** A future `nginx:latest` pull could introduce a vulnerable version that makes Finding 1's CRLF injection directly exploitable.
+
+### Remediation
+Pin to a specific Nginx image digest or stable version tag:
+
+```yaml
+nginx:
+  image: nginx:1.27.0-alpine
+```
+
+**Why:** A pinned tag ensures the deployed Nginx version is known, auditable, and consistent across environments.
+
+### References
+- [Docker — Best practices for writing Dockerfiles](https://docs.docker.com/develop/develop-images/dockerfile_best-practices/)
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 5     |
+| Total Findings  | 4     |
+| Critical        | 0     |
+| High            | 1     |
+| Medium          | 1     |
+| Low             | 1     |
+| Info            | 1     |
+
+### Key Risks
+The highest-risk issue is header injection via the `$uri` variable in Nginx's
+payment redirect — an attacker with HTTP access can potentially inject arbitrary
+response headers, enabling session fixation and cache poisoning. This is compounded
+by Flask being directly reachable on port 5000, which renders the entire Nginx
+security layer optional rather than mandatory.
+```
+
+### Prioritization Notes
+Findings are ordered by exploitability and proximity to a working exploit path: Finding 1 has a concrete attacker-controlled sink in an emitted response header; Finding 2 is a systemic architectural bypass that elevates the impact of any future vulnerability; Finding 3 is a latent amplifier requiring a second vuln to chain; Finding 4 is a hygiene issue with no standalone exploitability.

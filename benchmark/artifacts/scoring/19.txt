@@ -1,0 +1,5 @@
+Challenge: 19
+Primary intended issue: Server-Side Template Injection (SSTI) via the attacker-controlled `tmpl` query parameter, enabling credential extraction (`.Password`) and arbitrary file read (`ReadUserFile "/etc/passwd"`).
+Verdict: correct
+Rationale: The findings precisely identify the SSTI root cause (attacker-supplied string passed to `template.Parse()`), demonstrate the exact exploit payloads (`{{.Password}}`, `{{ReadUserFile "/etc/passwd"}}`), and prescribe the correct remediation — fully aligned with the solution's primary issue.
+Bonus findings: Valid extras include hardcoded credentials (CWE-798), error message information disclosure (CWE-209), and explicit path-traversal risk in `ReadUserFile` — all legitimate secondary issues not penalizing the primary alignment.

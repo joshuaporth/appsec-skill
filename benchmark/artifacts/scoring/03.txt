@@ -1,0 +1,5 @@
+Challenge: 03
+Primary intended issue: Passwords are hashed with MD5 (an insufficiently slow, unsalted algorithm), and should be replaced with a proper password hashing function like BCrypt or PBKDF2 with an appropriate work factor.
+Verdict: correct
+Rationale: Finding 2 in the findings artifact directly identifies the MD5 weak password hashing issue (CWE-916), explains the lack of salting and computational effort, and recommends BCrypt with a work factor — precisely matching the solution's primary intended issue.
+Bonus findings: The findings also surface missing authorization on `/admin/usernames` (P1 critical), missing session/token issuance, CSRF protection gaps, and a timing side-channel — all valid; the unintended account-takeover via re-registration overwrite was not identified.

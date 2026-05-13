@@ -1,0 +1,5 @@
+Challenge: 06
+Primary intended issue: Reflected XSS via unsanitized user-controlled `name` query parameter interpolated raw into an HTML response, requiring HTML encoding (e.g., `html.EscapeString`) as the fix.
+Verdict: correct
+Rationale: The findings precisely identify the reflected XSS on the `/greet?name=` endpoint (Finding 1, CWE-79), correctly trace the unsanitized input flowing into the HTML response, and recommend HTML escaping via `html/template`/`html.EscapeString` — fully aligned with the solution's primary issue and fix direction.
+Bonus findings: Missing HTTP security headers (CSP, X-Frame-Options) and plain HTTP (no TLS) are valid secondary observations not present in the solution material.

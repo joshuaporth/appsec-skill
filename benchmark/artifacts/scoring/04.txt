@@ -1,0 +1,5 @@
+Challenge: 04
+Primary intended issue: Hardcoded credentials — the application embeds a plaintext username and password directly in source code, which should instead be hashed and stored securely (database, HSM, Key Vault, or environment variable).
+Verdict: correct
+Rationale: The findings identify hardcoded credentials (CWE-798) as the top P1 finding with the same remediation direction as the solution (move to environment variables, hash the password), fully matching the intended primary issue.
+Bonus findings: Plaintext password comparison, missing session issuance, timing attack (CWE-208), and login CSRF — all valid secondary issues not penalized.

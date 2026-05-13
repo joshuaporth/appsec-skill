@@ -1,0 +1,5 @@
+Challenge: 23
+Primary intended issue: Unsafe Reflection via passing the `user` query parameter directly to `Class.forName()`, allowing an attacker to instantiate arbitrary classes (e.g., `AdminUser` instead of `NormalUser`).
+Verdict: correct
+Rationale: Finding 1 in the frozen artifact precisely identifies the unsafe reflection vulnerability — `Class.forName(user)` on an unvalidated parameter, with `AdminUser` instantiation as the concrete exploit path, matching the solution's intended primary issue exactly.
+Bonus findings: Missing authentication (CWE-306), exception-based information disclosure (CWE-209), and EOL Spring Boot version (CWE-1104) are all valid secondary findings not penalized here.

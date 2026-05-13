@@ -1,0 +1,5 @@
+Challenge: 01
+Primary intended issue: Open redirect vulnerability via unvalidated `redirect_url` query parameter passed directly to Flask's `redirect()`.
+Verdict: correct
+Rationale: The findings correctly identify the open redirect (Finding 2, CWE-601) with accurate code location, exploitation mechanics, and remediation strategies (allowlist / relative-path enforcement) that match the solution's guidance exactly.
+Bonus findings: Log injection on line 20 (CWE-532 / CWE-117) correctly identified — solution author noted this as a bonus finding.

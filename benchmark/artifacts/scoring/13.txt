@@ -1,0 +1,5 @@
+Challenge: 13
+Primary intended issue: SQL Injection via an unparameterizable `ORDER BY` clause that requires manual allowlist validation rather than bind parameters.
+Verdict: correct
+Rationale: The findings correctly identify the raw concatenation of the attacker-controlled `orderBy` parameter into an ORDER BY clause, explicitly explain why JDBC parameterization cannot be used there, and prescribe an allowlist fix — exactly matching the solution's two recommended strategies.
+Bonus findings: Missing authentication on all endpoints (CWE-306, P2 HIGH) — valid secondary observation.

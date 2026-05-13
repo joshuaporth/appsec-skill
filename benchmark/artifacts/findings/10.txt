@@ -1,0 +1,207 @@
+I have all the information needed for a full three-pass security analysis. Let me now produce the structured report.
+
+---
+
+## Pass 1 — Triage
+
+**Language/Framework:** Node.js, Express.js, `jsonwebtoken`, `dotenv`
+
+**Entry Points:**
+- `GET /generate-token` — public, no auth, issues signed JWTs
+- `GET /admin` — gated by `verifyToken` middleware, then checks `username === 'admin'`
+
+**Trust Boundaries:**
+- `req.headers.authorization` — fully attacker-controlled
+- JWT payload content — attacker-controlled if the signature is not cryptographically verified
+
+**Sensitive Operations:**
+- JWT issuance via `jwt.sign()` (line 34)
+- JWT processing via `jwt.decode()` (line 16) — the critical gate for the admin route
+
+---
+
+## Findings
+
+---
+
+## Finding 1: JWT Signature Never Verified — Complete Authentication Bypass
+
+**File:** `main.js`
+**Lines:** 16–18
+**CWE:** CWE-347 — Improper Verification of Cryptographic Signature
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P1
+**Severity:** CRITICAL
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const decoded = jwt.decode(token, { complete: true });
+req.decoded = decoded.payload;
+
+next();
+```
+
+### Description
+`jwt.decode()` performs **no signature verification** — it only base64-decodes and JSON-parses the token. The server therefore accepts any token whose payload claims `username: "admin"`, regardless of whether it was signed with the correct secret. An attacker can craft a forged JWT by hand (or with any JWT library) with an arbitrary payload, pair it with a fake or empty signature, and gain full admin access. The `secretKey` loaded from the environment is entirely unused in the authentication path.
+
+**Concrete attacker payload:**
+```
+Header:  {"alg":"none","typ":"JWT"}   → eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0
+Payload: {"username":"admin"}         → eyJ1c2VybmFtZSI6ImFkbWluIn0
+Token:   eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VybmFtZSI6ImFkbWluIn0.
+```
+
+Sending `Authorization: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ1c2VybmFtZSI6ImFkbWluIn0.` grants the `200 Admin access granted` response with zero knowledge of the secret.
+
+### Prioritization
+Highest priority. This is a complete, zero-precondition authentication bypass with trivial exploitation. No other finding approaches this severity. Remediate before deployment.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to `GET /admin`. No other preconditions — no account, no valid secret, no brute-force required.
+- **Uncertainty Boundary:** None. `jwt.decode()` is documented to skip signature verification; this behavior is consistent across all `jsonwebtoken` versions.
+
+### Remediation
+Replace `jwt.decode()` with `jwt.verify()`, explicitly pin the algorithm, and handle verification errors:
+
+```javascript
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+
+  // Strip optional "Bearer " prefix
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+
+  try {
+    // jwt.verify() checks the signature AND validates claims (exp, etc.)
+    const decoded = jwt.verify(token, secretKey, { algorithms: ['HS256'] });
+    req.decoded = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+};
+```
+
+Explicitly passing `{ algorithms: ['HS256'] }` prevents a secondary `alg: none` bypass that some older `jsonwebtoken` versions permit even through `jwt.verify()`.
+
+### References
+- [CWE-347: Improper Verification of Cryptographic Signature](https://cwe.mitre.org/data/definitions/347.html)
+- [OWASP JWT Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html)
+
+---
+
+## Finding 2: Null Dereference on Malformed Token — Unhandled Exception / Potential DoS
+
+**File:** `main.js`
+**Lines:** 16–17
+**CWE:** CWE-476 — NULL Pointer Dereference (JavaScript: property access on null)
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P2
+**Severity:** MEDIUM
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const decoded = jwt.decode(token, { complete: true });
+req.decoded = decoded.payload;
+```
+
+### Description
+`jwt.decode()` returns `null` when the token is not a well-formed JWT (e.g., missing dots, invalid base64). The next line immediately accesses `decoded.payload` without a null check, throwing an uncaught `TypeError: Cannot read properties of null (reading 'payload')`. Express's default error handler returns a `500` response that, depending on the `NODE_ENV` setting, may include a full stack trace — disclosing internal file paths and library versions. Any unauthenticated client can trigger this by sending a single malformed `Authorization` header value.
+
+**Concrete attacker input:**
+```
+Authorization: notajwt
+```
+
+### Prioritization
+P2, secondary to Finding 1. Exploitable independently (causes 500 errors), but Fix 1's `try/catch` around `jwt.verify()` also eliminates this path entirely.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to any route protected by `verifyToken`. A non-empty `Authorization` header that is not a valid three-part JWT.
+- **Uncertainty Boundary:** Stack trace inclusion in 500 responses depends on Express `env` configuration. In production with `NODE_ENV=production`, Express omits the stack body but the 500 still indicates the middleware crashed.
+
+### Remediation
+The null-check is made redundant once `jwt.verify()` is adopted (Finding 1's fix wraps everything in `try/catch`). If keeping `jwt.decode()` for any reason, add an explicit guard:
+
+```javascript
+const decoded = jwt.decode(token, { complete: true });
+if (!decoded || !decoded.payload) {
+  return res.status(401).json({ message: 'Invalid token format' });
+}
+req.decoded = decoded.payload;
+```
+
+### References
+- [CWE-476: NULL Pointer Dereference](https://cwe.mitre.org/data/definitions/476.html)
+
+---
+
+## Finding 3: Missing HTTP Security Headers
+
+**File:** `main.js`
+**Lines:** 1–40 (entire file)
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+const app = express();
+// No helmet or security header middleware
+```
+
+### Description
+The application sets no HTTP security headers. Express.js does not add protective headers by default, so responses lack `X-Content-Type-Options`, `X-Frame-Options`, `Strict-Transport-Security`, and `Content-Security-Policy`. This is a low-impact finding given the app currently returns only JSON, but the absence becomes relevant if the application is extended with any HTML output or the same origin hosts a browser-facing surface.
+
+### Prioritization
+P3, lowest priority. Dependent on the application expanding beyond pure JSON API responses.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires a browser-facing surface or MIME confusion; not directly exploitable in the current JSON-only API.
+- **Uncertainty Boundary:** Impact scales with future changes to response types.
+
+### Remediation
+```javascript
+const helmet = require('helmet');
+app.use(helmet());
+```
+
+`helmet` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `HSTS`, and a default CSP with a single call.
+
+### References
+- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+
+---
+
+## Scan Summary
+
+```
+## Scan Summary
+
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 1     |
+| Total Findings  | 3     |
+| Critical        | 1     |
+| High            | 0     |
+| Medium          | 1     |
+| Low             | 1     |
+| Info            | 0     |
+
+### Key Risks
+The application contains a complete, zero-precondition authentication bypass: `jwt.decode()` is used
+instead of `jwt.verify()`, meaning the JWT signature is never checked and any attacker can forge an
+admin token trivially. Replacing that single call with `jwt.verify()` (+ algorithm pinning + try/catch)
+simultaneously eliminates all three findings, since the null-dereference and missing-auth issues share
+the same root cause.
+```
+
+**Prioritization note:** Findings are ordered by exploitability and blast radius. Finding 1 is the only finding that matters for immediate triage — it grants unrestricted admin access to any unauthenticated caller. The remediation for Finding 1 also resolves Finding 2 as a side-effect, making the full fix a small, localized change to a single middleware function.
+
+**Counterfactual invalidation (Finding 1):** Replacing `jwt.decode(token, { complete: true })` with `jwt.verify(token, secretKey, { algorithms: ['HS256'] })` inside a `try/catch` would make this finding invalid — the server would then cryptographically confirm the token was signed with the correct secret before trusting any payload claim.
