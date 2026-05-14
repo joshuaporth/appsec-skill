@@ -1,5 +1,5 @@
 Challenge: 13
-Primary intended issue: SQL Injection via an unparameterizable `ORDER BY` clause that requires manual allowlist validation rather than bind parameters.
+Primary intended issue: SQL Injection via an unparameterizable `ORDER BY` clause where user-controlled column names cannot be bound with JDBC placeholders and must instead be validated with an allowlist or mapped to a column index.
 Verdict: correct
-Rationale: The findings correctly identify the raw concatenation of the attacker-controlled `orderBy` parameter into an ORDER BY clause, explicitly explain why JDBC parameterization cannot be used there, and prescribe an allowlist fix — exactly matching the solution's two recommended strategies.
-Bonus findings: Missing authentication on all endpoints (CWE-306, P2 HIGH) — valid secondary observation.
+Rationale: The findings clearly identify the `ORDER BY` string concatenation as the primary vulnerability (Finding 1, HIGH/P1), explain why column names cannot use JDBC placeholders, and recommend exactly the same remediation strategies (allowlist of column names, or mapping to safe identifiers) described in the solution.
+Bonus findings: Finding 2 (missing authentication on both endpoints) is a valid secondary observation, appropriately caveated as MEDIUM confidence.

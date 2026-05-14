@@ -1,5 +1,5 @@
 Challenge: 27
-Primary intended issue: Integer overflow when quantity exceeds INT_MAX causes the total price to wrap to a negative value, allowing a user to appear owed money instead of charged.
+Primary intended issue: Integer overflow in a shopping system where entering a quantity ≥ 2,147,483,648 causes the price to wrap to a negative value, enabling a price-inversion exploit.
 Verdict: correct
-Rationale: Finding 1 in the frozen artifact precisely identifies the signed integer overflow at the unsigned→signed cast, demonstrates the exact exploit input (`2147483648`) producing `-2147483648 euros`, and recommends boundary checking — all fully aligned with the solution's described vulnerability and remediation.
-Bonus findings: Valid secondary findings on `strtoul` truncation (Finding 2) and missing `endptr` validation (Finding 3) are legitimate and additive.
+Rationale: The findings precisely identify the same integer overflow (unsigned-to-signed cast causing negative price output at input 2,147,483,648) described in the solution, with correct mechanics, the exact payload value, and an appropriate boundary-check remediation.
+Bonus findings: Finding 2 (unchecked `strtoul` return / truncation on 64-bit platforms) is a valid secondary issue not covered by the solution material.

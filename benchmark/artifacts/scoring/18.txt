@@ -1,5 +1,5 @@
 Challenge: 18
-Primary intended issue: Insecure Deserialization — `unserialize()` is called on attacker-controlled `$_POST['data']`, allowing an attacker to craft a serialized `User` object with `role = 'admin'` to gain admin access.
+Primary intended issue: Insecure Deserialization — attacker serializes a `User` object with `role=admin` and submits it via the form to gain admin access without credentials.
 Verdict: correct
-Rationale: The findings identify the exact vulnerability (PHP Object Injection via `unserialize($_POST['data'])`), provide the correct exploitation mechanic (crafting a serialized `User` object with `role = 'admin'`), and supply a proof-of-concept payload that mirrors the solution's exploit output.
-Bonus findings: Valid secondary issues identified — broken authentication design (no credential verification) and stored XSS via missing `htmlspecialchars()` on echoed session data.
+Rationale: The findings precisely identify `unserialize($_POST['data'])` as the root cause (Finding 1, CWE-502), include the exact exploit payload (`O:4:"User":2:{...role:admin...}`), confirm zero preconditions for exploitation, and recommend switching to JSON — matching the solution's description and remediation verbatim.
+Bonus findings: Valid secondary issues reported: reflected/stored XSS via unencoded `__toString()` output, missing CSRF protection on the session-modifying form, and `@` error suppression masking deserialization failures.

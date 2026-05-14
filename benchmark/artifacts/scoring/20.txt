@@ -1,5 +1,5 @@
 Challenge: 20
-Primary intended issue: Path traversal (Local File Inclusion) via unsanitized `filename` parameter allowing arbitrary file read with `../../../../../../etc/passwd` on the `/files/download` endpoint.
+Primary intended issue: Local File Inclusion via Path Traversal on the `/files/download` endpoint, allowing arbitrary file reads using `../` sequences.
 Verdict: correct
-Rationale: Finding 1 in the frozen artifact precisely identifies CWE-22 path traversal on `/files/download?filename=`, provides the exact `../../../etc/passwd` exploit payload, and recommends the canonical path check fix — all matching the solution's primary issue and remediation strategies.
-Bonus findings: Valid additional issues identified: absolute-path bypass on `/files/metadata` (Paths.get multi-arg behavior), missing authentication (CWE-306), and container running as root (CWE-250).
+Rationale: The findings precisely identify the path traversal vulnerability in `FileController.java`'s `/files/download` endpoint (Finding 1), demonstrate the exact exploit (`../../etc/passwd`), and provide two equivalent remediation strategies (normalize + startsWith boundary check) matching the solution's canonical path check approach.
+Bonus findings: Finding 2 (absolute-path injection on `/files/metadata`) and Finding 3 (missing authentication) are valid additional issues not covered by the solution material.

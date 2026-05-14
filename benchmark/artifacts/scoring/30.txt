@@ -1,5 +1,5 @@
 Challenge: 30
-Primary intended issue: User-controlled HTML is embedded unsanitized into a wkhtmltopdf template, allowing HTML injection that the headless browser renderer processes server-side — enabling SSRF via iframes, local file reads, and JavaScript exfiltration.
+Primary intended issue: User-controlled HTML is embedded without sanitization into a wkhtmltopdf-rendered template, enabling SSRF via injected iframes/scripts because the renderer behaves like a headless browser.
 Verdict: correct
-Rationale: The findings identify exactly the intended primary issue (Finding 1, P1 CRITICAL): `req.Content` is inserted verbatim into HTML rendered by wkhtmltopdf acting as a headless browser, enabling SSRF/LFI via `<iframe>` injection, and the recommended fix (`html.EscapeString`) matches the authoritative solution precisely.
-Bonus findings: Missing authentication (F2), container runs as root (F3), unchecked error causing nil-pointer panic (F4), and missing request body size limit (F5) are all valid secondary findings not penalized.
+Rationale: Finding 1 in the frozen artifact precisely identifies the unsanitized `req.Content` interpolation into wkhtmltopdf as an SSRF/LFI vector, provides concrete iframe and XHR payloads matching the solution's description, and recommends the same mitigations (HTML escaping/sanitization plus renderer hardening flags).
+Bonus findings: Missing authentication (Finding 2), root container (Finding 3), and ignored error return (Finding 4) are all valid secondary observations.

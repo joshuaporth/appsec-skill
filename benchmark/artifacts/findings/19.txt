@@ -1,30 +1,66 @@
-Now I have everything needed for the three-pass review. Let me analyze.
+Now I have everything I need. Running the full three-pass analysis on the Go application.
 
 ---
 
-## Pass 1 — Attack Surface Map (internal)
+## Pass 1 — Triage
 
-- **Language:** Go 1.20, stdlib only (`net/http`, `html/template`, `os`)
-- **Single entry point:** `GET /` with query parameter `tmpl`
-- **Untrusted input:** `r.URL.Query().Get("tmpl")` — fully attacker-controlled
-- **Sensitive operations:**
-  - Template *source* parsed from user input (line 30)
-  - `ReadUserFile` registered as a FuncMap function AND is a method on `*User`
-  - `user` object (with `Password` field) passed as template execution data
-  - `os.ReadFile(filename)` with no path restriction
-- **Trust boundary violation:** attacker controls the template itself, not just data interpolated into it
+**Language/Framework:** Go 1.20, standard library only (`html/template`, `net/http`, `os`)
+
+**Entry Points:**
+- `GET /` → `handler()` — single HTTP route, no auth
+- `tmpl` query parameter — fully attacker-controlled string
+
+**Trust Boundaries:**
+- `r.URL.Query().Get("tmpl")` is raw user input
+- `user.Password = "Password123!"` is hardcoded in handler scope
+- `os.ReadFile(filename)` in `ReadUserFile` — filesystem access, no path restriction
+
+**Sensitive Operations:**
+- `template.New("page").Funcs(funcs).Parse(tmpl)` — user input parsed as template source
+- `t.Execute(w, user)` — template executed with `User` struct (including `Password`)
+- `ReadUserFile` registered in FuncMap — exposes `os.ReadFile` to template execution context
 
 ---
 
-## Pass 2 — Deep Scan & Pass 3 — Validation
+## Pass 2 — Deep Scan
+
+### SSTI + LFI Chain (main.go:22–36)
+
+The `tmpl` query parameter becomes the template source directly. The registered FuncMap exposes `ReadUserFile` which calls `os.ReadFile(filename)` with no path validation. The `user.Password` field is accessible as `.Password`.
+
+Exploit shapes:
+- `?tmpl={{.Password}}` → returns `Password123!`
+- `?tmpl={{ReadUserFile "/etc/passwd"}}` → arbitrary file read
+- `?tmpl={{ReadUserFile "/proc/self/environ"}}` → environment variable exfiltration
+
+### Hardcoded Credential (main.go:21)
+
+`user := &User{Email: "test@example.com", Password: "Password123!"}` — password hardcoded in source, directly exposed as a template data field.
+
+### Error Disclosure (main.go:32–34, 37–39)
+
+`http.Error(w, err.Error(), http.StatusInternalServerError)` — raw Go error strings returned to client on both parse and execute failure.
 
 ---
 
-## Finding 1: Server-Side Template Injection (Template Source Injection)
+## Pass 3 — Validation
 
+**SSTI → LFI:** Fully confirmed. No sanitization anywhere in the pipeline. Zero preconditions. The `html/template` package provides HTML-safe *output encoding* but does not restrict template *logic* or function calls. Any HTTP client can exploit this.
+
+**Hardcoded credentials:** Confirmed. Compounded by SSTI, which makes the password trivially extractable without source access.
+
+**Error disclosure:** Confirmed, minor. Go template parse errors can include user-controlled content reflected back. Lower priority given SSTI dwarfs this.
+
+**Counterfactual check (SSTI):** Removing `tmpl := r.URL.Query().Get("tmpl")` and instead using a static template string (or a server-side template file looked up by allowlisted name) eliminates the finding entirely.
+
+---
+
+## Finding 1: Server-Side Template Injection → Local File Inclusion
+
+**Finding ID:** `APPSEC-c3d9f2a71b4e`
 **File:** `main.go`
 **Lines:** 22–36
-**CWE:** CWE-94 — Improper Control of Generation of Code
+**CWE:** CWE-94 — Improper Control of Generation of Code ('Code Injection')
 **OWASP Category:** A03:2021 – Injection
 **Priority:** P1
 **Severity:** CRITICAL
@@ -52,57 +88,108 @@ if err = t.Execute(w, user); err != nil {
 ```
 
 ### Description
-The `tmpl` query parameter is used directly as the **template source** — not as data to be interpolated into a trusted template, but as the template definition itself. An attacker fully controls the template program that executes in the server process. Although `html/template` provides XSS-safe HTML context escaping, it provides no restriction on which struct fields or registered functions a template can invoke. This means the attacker can access `.Password` via `{{.Password}}`, call `ReadUserFile` via `{{ReadUserFile "/etc/passwd"}}`, and call the same method directly via `{{.ReadUserFile "/etc/passwd"}}` (since it is an exported method on the `*User` data object passed to `Execute`). This is a direct, zero-precondition arbitrary data read and credential leak.
+The query parameter `tmpl` is parsed verbatim as a `html/template` template source and then executed with the `user` struct as data. An attacker controls the entire template program: they can access any exported field on the data object (including `{{.Password}}`) and invoke any registered FuncMap function (including `ReadUserFile`). `html/template` provides contextual HTML output escaping but places no restrictions on template logic, field access, or function invocation — it does not sandbox execution. Because `ReadUserFile` wraps `os.ReadFile` with no path validation, the attacker gains read access to any file the process can open: `?tmpl={{ReadUserFile "/etc/passwd"}}`, `?tmpl={{ReadUserFile "/proc/self/environ"}}`, or the application binary itself.
 
 ### Prioritization
-Highest-priority finding. The source→sink path is direct: attacker-supplied string → `template.Parse()` → `template.Execute()` with privileged data and functions. No authentication, encoding, or other control interrupts this path.
+Highest priority. This is a zero-precondition, unauthenticated, remotely exploitable critical finding combining template injection with unrestricted local file read. All other findings are secondary to this.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** None — unauthenticated, no rate limit, no input validation. Single HTTP GET request.
-- **Attacker-controlled input shape:**
-  - `GET /?tmpl={{.Password}}` → returns `Password123!`
-  - `GET /?tmpl={{ReadUserFile "/etc/passwd"}}` → returns `/etc/passwd` contents
-  - `GET /?tmpl={{.ReadUserFile "/proc/self/environ"}}` → returns process environment variables (may include injected secrets)
-- **Uncertainty Boundary:** Impact is bounded by what the container process user can read from the filesystem. The distroless base image reduces the available attack surface compared to a full OS, but `/proc/self/environ`, the application binary, and any mounted secrets/configs remain readable.
+- **Exploit Preconditions:** None — any HTTP GET request to `/` with a crafted `tmpl` parameter is sufficient. No authentication, no special network position required.
+- **Uncertainty Boundary:** In a distroless container (as in the Dockerfile), filesystem access is limited to what is in the image. However, `/proc/self/environ`, `/proc/self/maps`, the Go binary at `/app/main`, and any mounted secrets are still readable.
 
 ### Remediation
-Never use attacker-supplied data as the template source. Store trusted templates on disk or in a safe store; accept only data that gets interpolated into those templates.
+Never use user-controlled input as a template source. Use a server-side template file identified by an allowlisted name, or eliminate the dynamic template entirely:
 
 ```go
-// After — template loaded from trusted source; only data comes from request
-const pageTmpl = `<html><body>Welcome, {{.Email}}</body></html>`
-
+// Option A: allowlisted template name → server-side file
 func handler(w http.ResponseWriter, r *http.Request) {
-    user := &User{Email: "test@example.com"}  // Password not in template data
-    t, err := template.New("page").Parse(pageTmpl)
-    if err != nil {
-        http.Error(w, "Internal error", http.StatusInternalServerError)
+    name := r.URL.Query().Get("page")
+    allowed := map[string]bool{"home": true, "about": true}
+    if !allowed[name] {
+        http.Error(w, "not found", http.StatusNotFound)
         return
     }
-    if err = t.Execute(w, user); err != nil {
-        http.Error(w, "Internal error", http.StatusInternalServerError)
+    t, err := template.ParseFiles("templates/" + name + ".html")
+    if err != nil {
+        http.Error(w, "internal error", http.StatusInternalServerError)
+        return
+    }
+    // Do not expose sensitive data in template context
+    if err = t.Execute(w, nil); err != nil {
+        http.Error(w, "internal error", http.StatusInternalServerError)
     }
 }
-// Why: the template program is fixed and trusted; attacker can only influence
-//      the values of whitelisted data fields, not the template logic itself.
+
+// Option B: if dynamic rendering is genuinely required, pre-parse templates
+// at startup and select by allowlisted key — never parse attacker-supplied strings.
 ```
 
-**Counterfactual invalidation:** If `tmpl` were loaded from a trusted file path resolved server-side (e.g., an allowlisted name mapped to a file in a templates directory) rather than from query parameter content, this finding would not be valid.
+Additionally, remove `ReadUserFile` from the FuncMap entirely. If file reading is needed, implement it server-side with strict canonicalization and base-path enforcement, never exposing it to template callers.
 
 ### References
-- https://cwe.mitre.org/data/definitions/94.html
-- https://pkg.go.dev/html/template#hdr-Security_Model
+- [CWE-94: Improper Control of Generation of Code](https://cwe.mitre.org/data/definitions/94.html)
+- [OWASP Server-Side Template Injection](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/07-Input_Validation_Testing/18-Testing_for_Server-Side_Template_Injection)
 
 ---
 
-## Finding 2: Arbitrary File Read via Unrestricted `ReadUserFile`
+## Finding 2: Hardcoded Password in Source Code
 
+**Finding ID:** `APPSEC-8f1e4b29c7a3`
+**File:** `main.go`
+**Lines:** 21
+**CWE:** CWE-798 — Use of Hard-coded Credentials
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P1
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```go
+user := &User{Email: "test@example.com", Password: "Password123!"}
+```
+
+### Description
+A plaintext password is hardcoded directly in the handler and bound into the template data context as `.Password`. Combined with Finding 1, any attacker can retrieve it with `?tmpl={{.Password}}` — no source access needed. Even absent the SSTI, hardcoded credentials appear in version control history forever, are visible to anyone with repository read access, and cannot be rotated without a code change. This credential represents an authentication factor with no rotation mechanism.
+
+### Prioritization
+P1, second only to Finding 1. The SSTI makes this trivially exploitable over HTTP with a single request. Even if Finding 1 were fixed, hardcoded credentials in source remain a standalone HIGH.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Exploitable directly via Finding 1 with zero preconditions. Independently, exploitable by anyone with source or git history access.
+- **Uncertainty Boundary:** It is unclear whether this credential is reused elsewhere in a real deployment. If it is, the blast radius extends beyond this service.
+
+### Remediation
+Remove credentials from source entirely. Load them at runtime from environment variables or a secrets manager, and never place them in the template data context:
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+    // Do not put credentials in the template data context at all.
+    // If user data is needed, expose only what the template requires.
+    data := struct{ Email string }{Email: os.Getenv("APP_USER_EMAIL")}
+
+    t, err := template.ParseFiles("templates/page.html") // static template
+    if err != nil { ... }
+    t.Execute(w, data)
+}
+```
+
+If the password is needed for authentication logic, use `os.Getenv("APP_PASSWORD")` at startup and store only the **hash** (bcrypt cost ≥ 12), never the plaintext.
+
+### References
+- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
+- [OWASP: Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+
+---
+
+## Finding 3: Unrestricted File Read via Exported Template Function
+
+**Finding ID:** `APPSEC-d4b7e9120f56`
 **File:** `main.go`
 **Lines:** 15–18, 24–28
-**CWE:** CWE-73 — External Control of File Name or Path
+**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P1
-**Severity:** CRITICAL
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
@@ -120,150 +207,49 @@ funcs := template.FuncMap{
 ```
 
 ### Description
-`ReadUserFile` accepts a caller-supplied `filename` with zero validation — no path canonicalization, no prefix check, no allowlist. It is exposed in two ways simultaneously: (1) registered in the template FuncMap so any template can call `{{ReadUserFile "/any/path"}}`, and (2) an exported method on `*User`, making it callable directly from any template via `{{.ReadUserFile "/any/path"}}`. Combined with Finding 1 (attacker controls the template source), this gives an unauthenticated attacker full read access to any file the server process can open: environment variables, mounted secrets, TLS private keys, or other services' credential files.
+`ReadUserFile` accepts an arbitrary `filename` string and calls `os.ReadFile` directly with no canonicalization, no base-directory check, and no allowlist. It is registered as a FuncMap function and thus callable from any template the server executes. Via Finding 1, the attacker supplies both the template source and the filename argument: `?tmpl={{ReadUserFile "/etc/passwd"}}`. In a container context, readable targets include `/proc/self/environ` (environment variables, potential secrets), `/proc/self/cmdline`, mounted Kubernetes secrets (commonly at `/var/run/secrets/kubernetes.io/serviceaccount/token`), and the application binary. Errors from `os.ReadFile` are silently discarded (`_`), so failed reads return an empty string — this enables oracle-style enumeration of paths.
 
 ### Prioritization
-Co-primary with Finding 1 — both are required for exploitation, and both must be fixed. This finding represents the dangerous capability; Finding 1 is the unlocking mechanism.
+P1 together with Finding 1. This function is the primary exploitation primitive that Finding 1 enables. Fixing Finding 1 without removing or hardening `ReadUserFile` leaves a residual risk if any future template access is added.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Finding 1 must be exploitable (it is, unconditionally). Two equivalent payloads reach this sink:
-  - `GET /?tmpl={{ReadUserFile "/proc/self/environ"}}`
-  - `GET /?tmpl={{.ReadUserFile "/proc/self/environ"}}`
-- **Uncertainty Boundary:** Exact files readable depend on the container user's UID and filesystem mounts. A distroless image limits available binaries but does not restrict mounted secrets or `/proc` entries.
+- **Exploit Preconditions:** Requires Finding 1 (SSTI) to be exploitable. If SSTI is fixed, `ReadUserFile` is no longer callable from outside.
+- **Uncertainty Boundary:** Impact depends on what secrets are mounted into the container at runtime. In a distroless base image, userland tools are absent, but proc filesystem and mounted secrets remain accessible.
 
 ### Remediation
-Remove `ReadUserFile` from the FuncMap entirely — privileged file-reading helpers must never be exposed as callable template functions when any part of the template is attacker-influenced. If file reading is a legitimate feature, add strict path confinement:
+Remove `ReadUserFile` from the FuncMap entirely. If a use case genuinely requires reading a file and reflecting its content, enforce a strict allowlist and canonicalize the path:
 
 ```go
-// If ReadUserFile must exist, confine it to a trusted directory
-func (u *User) ReadUserFile(filename string) (string, error) {
-    const baseDir = "/app/user-files/"
-    safe := filepath.Join(baseDir, filename)
-    safe, err := filepath.EvalSymlinks(safe)
-    if err != nil || !strings.HasPrefix(safe, filepath.Clean(baseDir)+string(os.PathSeparator)) {
-        return "", errors.New("invalid file path")
+func safeReadFile(filename string) (string, error) {
+    const baseDir = "/app/user-files"
+    // Resolve to absolute, canonical path
+    abs, err := filepath.Abs(filepath.Join(baseDir, filename))
+    if err != nil {
+        return "", err
     }
-    data, err := os.ReadFile(safe)
+    base, _ := filepath.Abs(baseDir)
+    if !strings.HasPrefix(abs, base+string(filepath.Separator)) {
+        return "", fmt.Errorf("path traversal detected")
+    }
+    data, err := os.ReadFile(abs)
     if err != nil {
         return "", err
     }
     return string(data), nil
 }
-// Why: EvalSymlinks + HasPrefix enforces the path stays within baseDir,
-//      preventing ../  and symlink traversal escapes.
 ```
 
-**Counterfactual invalidation:** Removing `ReadUserFile` from the FuncMap and not exposing it via a data object with attacker-callable methods would eliminate this finding.
-
 ### References
-- https://cwe.mitre.org/data/definitions/73.html
-- https://owasp.org/www-community/attacks/Path_Traversal
+- [CWE-22: Path Traversal](https://cwe.mitre.org/data/definitions/22.html)
+- [OWASP: Path Traversal](https://owasp.org/www-community/attacks/Path_Traversal)
 
 ---
 
-## Finding 3: Sensitive Credential Exposed in Template Execution Context
+## Finding 4: Internal Error Details Returned to Client
 
+**Finding ID:** `APPSEC-2c8a1f034d79`
 **File:** `main.go`
-**Lines:** 21, 36
-**CWE:** CWE-312 — Cleartext Storage of Sensitive Information (in accessible context)
-**OWASP Category:** A02:2021 – Cryptographic Failures
-**Priority:** P1
-**Severity:** HIGH
-**Confidence:** HIGH
-
-### Vulnerable Code
-```go
-user := &User{Email: "test@example.com", Password: "Password123!"}
-// ...
-if err = t.Execute(w, user); err != nil {
-```
-
-### Description
-The full `User` struct — including its `Password` field — is passed as the root data object to template execution. Because Go's `html/template` makes all exported fields accessible from templates as `.FieldName`, the `Password` field is directly reachable. Even without Finding 1, if templates were ever sourced from a less-controlled location, `.Password` would leak. With Finding 1 active, the exploit is a one-liner: `GET /?tmpl={{.Password}}` returns `Password123!` in the response body. This is a distinct design defect: security-sensitive fields must never be included in template data objects when templates can be influenced by untrusted parties.
-
-### Prioritization
-Secondary to Findings 1 and 2 in terms of root cause, but directly exploitable as a consequence. Must be fixed alongside Finding 1 as defense-in-depth.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Requires Finding 1 to be exploitable (no additional preconditions).
-- **Attacker-controlled input:** `GET /?tmpl={{.Password}}` → response body: `Password123!`
-- **Uncertainty Boundary:** None — the field name and value are static in source.
-
-### Remediation
-Pass only the minimum necessary data to templates using a dedicated view/DTO struct:
-
-```go
-type UserView struct {
-    Email string
-    // Password intentionally excluded
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-    user := &User{Email: "test@example.com", Password: "Password123!"}
-    view := UserView{Email: user.Email}
-    // ...
-    if err = t.Execute(w, view); err != nil { ... }
-}
-// Why: the template can only access fields explicitly placed in the view struct;
-//      credential fields are structurally unreachable from template logic.
-```
-
-**Counterfactual invalidation:** Passing a view struct that omits `Password` would make `.Password` undefined in the template context and eliminate this finding.
-
-### References
-- https://cwe.mitre.org/data/definitions/312.html
-
----
-
-## Finding 4: Hardcoded Credentials in Source Code
-
-**File:** `main.go`
-**Lines:** 21
-**CWE:** CWE-798 — Use of Hard-coded Credentials
-**OWASP Category:** A02:2021 – Cryptographic Failures
-**Priority:** P2
-**Severity:** HIGH
-**Confidence:** HIGH
-
-### Vulnerable Code
-```go
-user := &User{Email: "test@example.com", Password: "Password123!"}
-```
-
-### Description
-A plaintext password is hardcoded directly in the handler function. Any developer with read access to the repository, any build artifact, or any process-memory dump can recover this credential. While these may be placeholder values in a challenge context, the pattern is dangerous in any real deployment: credentials committed to source are frequently discovered via git history, leaked repositories, or container image layer inspection even after being removed from the current HEAD.
-
-### Prioritization
-Lower than Findings 1–3 because it does not independently unlock a new exploit path — the same credential is already exposed by Finding 3. However, it must be remediated separately: even after fixing the template context exposure, the credential remains recoverable from source history and container images.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Read access to the source repository, built binary, or container image.
-- **Uncertainty Boundary:** Whether these are real production credentials or test placeholders changes impact; the code pattern is equally dangerous regardless.
-
-### Remediation
-Load credentials from environment variables or a secrets manager at runtime; never commit them to source:
-
-```go
-func main() {
-    password := os.Getenv("APP_PASSWORD")
-    if password == "" {
-        log.Fatal("APP_PASSWORD environment variable is required")
-    }
-    // pass to handler via closure or config struct
-}
-```
-
-**Counterfactual invalidation:** Moving credentials to environment variables (and ensuring no `.env` file is committed) eliminates this finding.
-
-### References
-- https://cwe.mitre.org/data/definitions/798.html
-
----
-
-## Finding 5: Internal Error Details Returned to Client
-
-**File:** `main.go`
-**Lines:** 32, 37
+**Lines:** 32–34, 37–39
 **CWE:** CWE-209 — Generation of Error Message Containing Sensitive Information
 **OWASP Category:** A05:2021 – Security Misconfiguration
 **Priority:** P3
@@ -283,53 +269,52 @@ if err = t.Execute(w, user); err != nil {
 ```
 
 ### Description
-Raw Go error messages from template parsing and execution are sent directly to the HTTP response. Template parse errors may include fragments of the template source (echoing attacker input back) and internal Go type names or paths. Execution errors may leak field names, type reflections, or partial data values. While the impact is low compared to Findings 1–4, returning unfiltered error strings is a bad-practice baseline that aids attacker reconnaissance.
+Raw Go error strings are written into HTTP responses on both template parse failure and execution failure. Template parse errors can reflect portions of the malformed input back to the caller, and execution errors may include internal type information or field names from the data struct. This assists attacker reconnaissance and may leak structural details about the `User` type or template execution context.
 
 ### Prioritization
-Lowest priority — useful signal for an attacker but not independently exploitable given the severity of Findings 1–4.
+P3 — lowest priority. The dominant risks are Findings 1–3. However, this should be fixed as part of hardening regardless.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Sending a malformed template string (e.g., `?tmpl={{`).
-- **Uncertainty Boundary:** Exact information disclosed depends on the Go runtime error representation.
+- **Exploit Preconditions:** Attacker sends a malformed template string that causes a parse or execution error.
+- **Uncertainty Boundary:** Go template error messages are generally descriptive but not catastrophic in isolation. Impact is reconnaissance assistance, not direct data exfiltration.
 
 ### Remediation
+Return a generic error message to clients and log the detail server-side:
+
 ```go
-// Log the full error server-side; return only a generic message to the client
 if err != nil {
-    log.Printf("template error: %v", err)
-    http.Error(w, "Internal server error", http.StatusInternalServerError)
+    log.Printf("template parse error: %v", err)
+    http.Error(w, "internal server error", http.StatusInternalServerError)
     return
+}
+
+if err = t.Execute(w, user); err != nil {
+    log.Printf("template execute error: %v", err)
+    http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 ```
 
 ### References
-- https://cwe.mitre.org/data/definitions/209.html
+- [CWE-209: Information Exposure Through an Error Message](https://cwe.mitre.org/data/definitions/209.html)
 
 ---
-
-## Scan Summary
 
 ```
 ## Scan Summary
 
 | Metric          | Value |
 |-----------------|-------|
-| Files Analyzed  | 2     |
-| Total Findings  | 5     |
-| Critical        | 2     |
+| Files Analyzed  | 1     |
+| Total Findings  | 4     |
+| Critical        | 1     |
 | High            | 2     |
 | Medium          | 0     |
 | Low             | 1     |
 | Info            | 0     |
 
 ### Key Risks
-The dominant risk is unauthenticated, zero-precondition server-side template injection
-(Finding 1) that grants arbitrary file read (Finding 2) and credential exfiltration
-(Findings 3–4) via a single HTTP GET request. The combination of attacker-controlled
-template source + an unrestricted file-read function in the FuncMap + a password field
-in the execution context creates a trivially exploitable chain requiring no
-authentication, no special tooling, and no brute force.
+The dominant risk is a zero-precondition SSTI (Finding 1) that gives unauthenticated remote attackers full read access to arbitrary filesystem paths via a registered `ReadUserFile` function, and trivially exposes the hardcoded plaintext password (Finding 2) bound into the template data context. All three P1 findings share a single root cause: user-controlled input (`tmpl` query parameter) is parsed as executable template source — fixing that one architectural mistake eliminates the entire critical attack surface.
 ```
 
 ### Prioritization Notes
-Findings 1 and 2 are co-primary (P1) and must be fixed together — eliminating the template source injection (Finding 1) breaks the chain, but leaving the unsafe `ReadUserFile` design in place is a latent risk if template sourcing ever changes. Finding 3 should be fixed alongside them as structural defense-in-depth. Finding 4 (hardcoded credentials) is an independent P2 that persists in git history regardless of runtime fixes.
+All three P1 findings (SSTI, hardcoded credential, unrestricted file read) are treated as equally urgent because they form a single exploit chain exploitable with one HTTP request. Remediation should address Finding 1 (eliminate user-controlled template parsing) first — doing so also neutralizes Findings 2 and 3 as attack surfaces, though both should still be independently fixed as defense-in-depth.

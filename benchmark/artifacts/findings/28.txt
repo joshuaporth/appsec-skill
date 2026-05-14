@@ -1,28 +1,31 @@
-I now have everything I need. Running all three passes of analysis.
+Now I have everything I need. Let me conduct all three passes on the codebase.
+
+**Pass 1 — Attack Surface:**
+- Node.js/Express app behind nginx reverse proxy
+- Entry points: `GET/POST /login`, `GET /dashboard`, `GET /profile*`
+- nginx caches responses for URLs matching `~* \.(css|js|jpg|png|gif)$` — no cookie in cache key
+- Sensitive operations: password auth, session management, API key retrieval
+- `package.json` name includes "webcachedeception" — deliberately hints at the primary vulnerability class
+
+**Pass 2 — Deep Scan in progress...**
+**Pass 3 — Validation complete.**
 
 ---
 
-## Security Review — `appsec-challenge-28`
+## Finding 1: Web Cache Deception — Unauthenticated API Key Exfiltration
 
-**Scope:** `main.js`, `nginx.conf`, `package.json`, `Dockerfile`, `docker-compose.yml`  
-**Stack:** Node.js 20 · Express 4.21.2 · express-session 1.18.1 · Nginx (Alpine)
-
----
-
-## Finding 1: Web Cache Deception — Authenticated Response Caching
-
-**File:** `nginx.conf` + `main.js`  
-**Lines:** `nginx.conf:17–24` (cache rule) × `main.js:52–61` (profile route)  
-**CWE:** CWE-524 — Use of Cache Containing Sensitive Information  
-**OWASP Category:** A05:2021 – Security Misconfiguration  
-**Priority:** P1  
-**Severity:** CRITICAL  
+**Finding ID:** `APPSEC-f3a82c1d09`
+**File:** `nginx.conf` (lines 17–25) + `main.js` (line 52)
+**Lines:** `nginx.conf:17–25`, `main.js:52–61`
+**CWE:** CWE-525 — Use of Web Browser Cache Containing Sensitive Information / CWE-284 — Improper Access Control
+**OWASP Category:** A05:2021 – Security Misconfiguration / A01:2021 – Broken Access Control
+**Priority:** P1
+**Severity:** CRITICAL
 **Confidence:** HIGH
 
 ### Vulnerable Code
-
 ```nginx
-# nginx.conf:17–24
+# nginx.conf:17–25
 location ~* \.(css|js|jpg|png|gif)$ {
     proxy_pass http://express-app:5000;
     expires 30d;
@@ -33,7 +36,6 @@ location ~* \.(css|js|jpg|png|gif)$ {
     add_header X-Cached $upstream_cache_status;
 }
 ```
-
 ```javascript
 // main.js:52–61
 app.get("/profile*", (req, res) => {
@@ -49,80 +51,76 @@ app.get("/profile*", (req, res) => {
 ```
 
 ### Description
-
-Nginx's cache rule matches any URL whose **path ends** in `.css`, `.js`, `.jpg`, `.png`, or `.gif` — including paths like `/profile/steal.jpg`. Express's `/profile*` wildcard route matches the same URL and returns the authenticated user's API key. When an authenticated victim visits `http://example.com/profile/steal.jpg` (e.g., tricked via a phishing link or an `<img src>` tag), Nginx caches the response keyed on that URL. Any subsequent unauthenticated request to `http://example.com/profile/steal.jpg` receives the cached, victim-authenticated response — including the API key — without any session cookie.
-
-**Attack sequence:**
-1. Attacker crafts `http://example.com/profile/steal.jpg`
-2. Victim (authenticated admin) visits it — intentionally or via embedded link/image
-3. Nginx caches the `200 OK` response with `admin - API Key: API-KEY-1234567890-SECRET` for 1 hour
-4. Attacker fetches `http://example.com/profile/steal.jpg` unauthenticated → receives the victim's API key from cache
+The nginx `proxy_cache` location block caches any response whose URL path ends in `.css`, `.js`, `.jpg`, `.png`, or `.gif`. The default `proxy_cache_key` is `$scheme$proxy_host$request_uri`, which **does not include the `Cookie` header**. Express's wildcard route `/profile*` matches any path beginning with `/profile` — including `/profile.css`, `/profile.jpg`, etc. An attacker who tricks an authenticated victim into requesting `http://example.com/profile.css` will cause nginx to cache the victim's authenticated API key response (keyed only by URL, not by session). Any subsequent unauthenticated request to `/profile.css` receives the cached response containing the victim's API key. The response is cached for one hour per `proxy_cache_valid 200 1h`. The Express app sets no `Cache-Control: no-store` header on the `/profile*` handler and no `proxy_no_cache`/`proxy_cache_bypass` directive exists in the nginx config.
 
 ### Prioritization
-
-Highest-priority finding. Directly leaks the admin API key with no authentication required post-cache-population, exploitable by any network-accessible attacker. The only precondition is tricking the authenticated user into visiting a single URL — trivially achievable via social engineering or an embedded image tag.
+This is the highest-priority finding. It allows full unauthenticated exfiltration of a logged-in user's API key with no prior access required beyond tricking the victim into clicking a link. No brute force, no injection, no session required.
 
 ### Exploitability Notes
-
-- **Exploit Preconditions:** (a) Attacker can trick an authenticated user into visiting the crafted URL; (b) the URL had not been cached previously with a non-200 status
-- **Uncertainty Boundary:** Default Nginx `proxy_cache_key` is `$scheme$proxy_host$request_uri` — this is confirmed as sufficient to share the cache entry across users. Behavior unchanged regardless of Nginx version within any reasonably modern release
-
-**Counterfactual:** If the Express route were `/profile` (no wildcard) instead of `/profile*`, URLs ending in `.jpg` would not match it and would not return authenticated content — the caching rule would become harmless.
+- **Exploit Preconditions:** (1) A victim must be authenticated and navigate to a crafted URL like `http://example.com/profile.css` (via phishing, `<img src="...">`, clickjacking, etc.). (2) nginx must not have been explicitly configured with `proxy_cache_key` including `$cookie_*`. Both are true as written.
+- **Uncertainty Boundary:** If nginx is fronted by a CDN that normalizes extensions, the cache key behavior at that outer layer might differ. Within this config as written, exploitation is deterministic.
+- **Counterfactual invalidation:** Adding `Cache-Control: no-store, no-cache` in the Express `/profile*` handler (or `proxy_no_cache $cookie_session_id;` in nginx) would prevent caching of authenticated responses and eliminate this vulnerability.
+- **Concrete attacker input:** `GET /profile.css HTTP/1.1` (no `Cookie` header) — after the victim has primed the cache.
 
 ### Remediation
+Fix on both layers — defense in depth:
 
-Three complementary fixes — apply all three for defense-in-depth:
-
-**1. Remove the wildcard from the Express route (root cause fix):**
 ```javascript
-// Before
-app.get("/profile*", (req, res) => { ... });
-// After — exact match only
-app.get("/profile", (req, res) => { ... });
-```
+// main.js — Express: prevent any caching of authenticated responses
+app.get("/profile*", (req, res) => {
+    if (!req.session.user) {
+        return res.redirect("/login");
+    }
+    // Prevent reverse proxies from caching this authenticated response
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
 
-**2. Set `Cache-Control: no-store` on all authenticated responses:**
-```javascript
-app.get("/profile", (req, res) => {
-    if (!req.session.user) return res.redirect("/login");
-    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
     const user = req.session.user;
     const api_key = users_db[user].api_key;
     res.send(`${user} - API Key: ${api_key}`);
 });
 ```
 
-**3. Scope the Nginx cache rule to never match application routes (defense-in-depth):**
 ```nginx
-# Restrict cache to the explicit /static/ path only, not arbitrary URL endings
-location /static/ {
-    root /var/www/html/;
-    expires 30d;
+# nginx.conf — bypass and disable cache for any request carrying a session cookie
+location ~* \.(css|js|jpg|png|gif)$ {
+    proxy_pass http://express-app:5000;
     proxy_cache STATIC;
+    proxy_cache_key "$scheme$proxy_host$request_uri";
+    proxy_no_cache     $cookie_connect_sid;   # express-session default cookie name
+    proxy_cache_bypass $cookie_connect_sid;
     proxy_cache_valid 200 1h;
+    proxy_cache_valid any 5m;
+    add_header X-Cached $upstream_cache_status;
 }
-# Remove the extension-based regex cache rule entirely
+```
+
+Also, replace the wildcard Express route with an exact match to eliminate the surface entirely:
+```javascript
+// Change:
+app.get("/profile*", (req, res) => { ... });
+// To:
+app.get("/profile", (req, res) => { ... });
 ```
 
 ### References
-
-- [PortSwigger Web Security Academy — Web Cache Deception](https://portswigger.net/web-security/web-cache-deception)
-- [OWASP Web Security Testing Guide — Testing for Web Cache Deception (WSTG-SESS-09)](https://owasp.org/www-project-web-security-testing-guide/)
+- [PortSwigger: Web Cache Deception](https://portswigger.net/web-security/web-cache-deception)
+- [CWE-525: Information Exposure Through Browser Caching](https://cwe.mitre.org/data/definitions/525.html)
 
 ---
 
-## Finding 2: Hardcoded Credentials and Plaintext Password Storage
+## Finding 2: Hardcoded Credentials and Secrets
 
-**File:** `main.js`  
-**Lines:** 6–11  
-**CWE:** CWE-798 — Use of Hard-coded Credentials; CWE-256 — Plaintext Storage of a Password  
-**OWASP Category:** A02:2021 – Cryptographic Failures; A07:2021 – Identification and Authentication Failures  
-**Priority:** P1  
-**Severity:** HIGH  
+**Finding ID:** `APPSEC-c7b912a4f5`
+**File:** `main.js`
+**Lines:** 7–10, 15
+**CWE:** CWE-798 — Use of Hard-coded Credentials
+**OWASP Category:** A07:2021 – Identification and Authentication Failures / A02:2021 – Cryptographic Failures
+**Priority:** P1
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
-
 ```javascript
 const users_db = {
     "admin": {
@@ -130,119 +128,62 @@ const users_db = {
         "api_key": "API-KEY-1234567890-SECRET",
     }
 };
-```
 
-### Description
-
-The admin password is stored as a plaintext string literal (`"password"`) in source code — no hashing, no salt. The admin API key is also hardcoded alongside it. Any developer with read access to this repository obtains both credentials immediately; no cracking is required. If this code is committed to version control, both secrets are permanently embedded in git history even if later removed. A proper password store would hold a slow hash (bcrypt/Argon2id); a proper secret store would hold environment-variable-injected values, not literals.
-
-### Prioritization
-
-P1 alongside Finding 1. Hardcoded plaintext credentials are unconditionally exploitable by any insider with repo access and require no runtime interaction.
-
-### Exploitability Notes
-
-- **Exploit Preconditions:** Read access to source code or git history
-- **Uncertainty Boundary:** None — plaintext storage is unconditionally exploitable given repo access
-
-### Remediation
-
-**Passwords:** use bcrypt (cost ≥ 12) at registration time; compare with `bcrypt.compare()` at login:
-```javascript
-const bcrypt = require('bcrypt');
-
-// At user creation:
-const hash = await bcrypt.hash(plaintextPassword, 12);
-
-// At login:
-if (users_db[username] && await bcrypt.compare(password, users_db[username].password)) {
-    req.session.user = username;
-    return res.redirect('/dashboard');
-}
-```
-
-**API keys and secrets:** load from environment variables, never hardcode:
-```javascript
-// In real code — load from process.env or a vault client
-const api_key = process.env.ADMIN_API_KEY;
-```
-
-### References
-
-- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
-- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
-
----
-
-## Finding 3: Hardcoded Session Secret
-
-**File:** `main.js`  
-**Lines:** 15  
-**CWE:** CWE-798 — Use of Hard-coded Credentials  
-**OWASP Category:** A02:2021 – Cryptographic Failures  
-**Priority:** P1  
-**Severity:** HIGH  
-**Confidence:** HIGH
-
-### Vulnerable Code
-
-```javascript
 app.use(session({ secret: 'supersecretkey'}));
 ```
 
 ### Description
-
-`express-session` uses `secret` to sign session cookies with HMAC-SHA256. With a known, hardcoded value, an attacker who reads the source code can craft valid signed session cookies for arbitrary user IDs, bypassing authentication entirely — no password required. The comment `// Imagine this to be a secret loaded from a secure secret store` acknowledges the intent but does not change the actual behavior of the code.
+Three secrets are hardcoded in source: a trivial cleartext password (`"password"`), an API key (`"API-KEY-1234567890-SECRET"`), and an `express-session` signing secret (`'supersecretkey'`). The session secret is used to HMAC-sign session cookies; with it known, an attacker can forge session cookies for any username. The cleartext password storage means any code reviewer, contractor, or Git history reader can authenticate as admin without attacking the running system. The API key is directly exposed in source to the same audience.
 
 ### Prioritization
-
-P1. Combined with Finding 2 (hardcoded credentials), a source-code reader gets both password and session-forgery capability. Remediate alongside Finding 2.
+P1, ranked second after the web cache deception finding. A compromised session secret enables direct admin impersonation without network access; a leaked API key is equivalent to full account takeover.
 
 ### Exploitability Notes
-
-- **Exploit Preconditions:** Knowledge of the hardcoded secret string (read access to source or git history)
-- **Uncertainty Boundary:** None — `express-session` cookie signing is deterministic given the secret
+- **Exploit Preconditions:** Read access to source code (including Git history).
+- **Uncertainty Boundary:** If this is truly a stand-in for an external secret store (as the comments suggest), actual deployment may use environment variables. However, as committed, these are real values.
+- **Counterfactual invalidation:** Replacing the values with `process.env.SESSION_SECRET`, `process.env.ADMIN_PASSWORD`, and `process.env.ADMIN_API_KEY` and rotating the current values would eliminate this finding.
 
 ### Remediation
-
 ```javascript
-// Load from environment; fail fast if not set
+// Load secrets from environment variables — never from source
 const SESSION_SECRET = process.env.SESSION_SECRET;
-if (!SESSION_SECRET) throw new Error('SESSION_SECRET env var is required');
+if (!SESSION_SECRET) throw new Error("SESSION_SECRET env var is required");
 
 app.use(session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production', // require HTTPS in prod
-        sameSite: 'lax',
-    }
+    cookie: { secure: true, httpOnly: true, sameSite: 'strict' }
 }));
 ```
 
-Generate the secret at deploy time: `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"` and store it in your secret manager (AWS Secrets Manager, Vault, etc.).
+For passwords: store only a bcrypt hash in the database, not plaintext:
+```javascript
+const bcrypt = require('bcrypt');
+// At user creation:
+const hash = await bcrypt.hash(plaintextPassword, 12);
+// At login:
+const match = await bcrypt.compare(req.body.password, stored_hash);
+```
 
 ### References
-
-- [express-session security best practices](https://expressjs.com/en/resources/middleware/session.html)
-- [CWE-798](https://cwe.mitre.org/data/definitions/798.html)
+- [CWE-798: Use of Hard-coded Credentials](https://cwe.mitre.org/data/definitions/798.html)
+- [OWASP: Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
 
 ---
 
-## Finding 4: Session Fixation — No Session Regeneration After Login
+## Finding 3: Authentication Bypass via JavaScript Prototype Pollution
 
-**File:** `main.js`  
-**Lines:** 27–35  
-**CWE:** CWE-384 — Session Fixation  
-**OWASP Category:** A07:2021 – Identification and Authentication Failures  
-**Priority:** P2  
-**Severity:** MEDIUM  
+**Finding ID:** `APPSEC-8d4e231bc7`
+**File:** `main.js`
+**Lines:** 30–34
+**CWE:** CWE-284 — Improper Access Control / CWE-1321 — Improperly Controlled Modification of Object Prototype Attributes
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P2
+**Severity:** MEDIUM
 **Confidence:** HIGH
 
 ### Vulnerable Code
-
 ```javascript
 app.post("/login", (req, res) => {
     const { username, password } = req.body;
@@ -251,101 +192,257 @@ app.post("/login", (req, res) => {
         req.session.user = username;
         return res.redirect('/dashboard');
     }
-    ...
 ```
 
 ### Description
-
-When login succeeds, the code writes to the existing session (`req.session.user = username`) without regenerating the session ID first. An attacker who can set a known session cookie in the victim's browser (e.g., via a subdomain XSS or network interception on HTTP) can plant a pre-known session ID, wait for the victim to authenticate, and then use that ID to access the victim's authenticated session. The `express-session` library provides `req.session.regenerate()` precisely for this purpose.
+`users_db` is a plain JavaScript object, so `users_db[username]` resolves inherited prototype properties when `username` is `"toString"`, `"valueOf"`, `"hasOwnProperty"`, `"constructor"`, `"__proto__"`, etc. These prototype properties are truthy (they are functions). The second condition `users_db[username].password` accesses `.password` on the function object, which is `undefined`. If the POST body omits the `password` field entirely, `req.body.password` is also `undefined`, so `undefined === undefined` evaluates to `true`. The attacker receives a valid authenticated session under the username `"toString"` (or any other prototype property name) with no password required. A crafted `POST /login` body of `username=toString` (with no `password` field) produces an authenticated session, granting full access to all authenticated routes.
 
 ### Prioritization
-
-P2. Real-world exploitation requires the attacker to plant a session ID in the victim's browser before login, raising the bar relative to Findings 1–3.
+P2. Exploitable auth bypass, but in the current hardcoded setup the attacker's session maps to `"toString"` — not `"admin"` — so `users_db["toString"].api_key` returns `undefined`, limiting data exposure. Impact increases significantly if the app ever stores real user data or if the attacker combines this with other vulnerabilities.
 
 ### Exploitability Notes
-
-- **Exploit Preconditions:** Attacker must be able to set a session cookie in the victim's browser (requires same-site subdomain or prior MITM on HTTP)
-- **Uncertainty Boundary:** Since the app runs on HTTP (no TLS), cookie interception on the network is realistic, raising this to a meaningful risk
+- **Exploit Preconditions:** Send a POST to `/login` with `Content-Type: application/x-www-form-urlencoded`, body `username=toString`, and **no `password` field**.
+- **Uncertainty Boundary:** If a future developer adds real user data to `users_db`, the bypass yields a valid session for a ghost account; the exposed data is still limited to the prototype-name account's fields. Impact is bounded by the data model.
+- **Counterfactual invalidation:** Using `Object.create(null)` for `users_db` removes the prototype chain; alternatively, `Object.hasOwn(users_db, username)` as a guard eliminates the prototype property lookup.
 
 ### Remediation
-
 ```javascript
+// Option A: use a null-prototype object to eliminate inherited properties
+const users_db = Object.create(null);
+users_db["admin"] = { password: "...", api_key: "..." };
+
+// Option B: guard every lookup with Object.hasOwn
 app.post("/login", (req, res) => {
     const { username, password } = req.body;
-
-    if (users_db[username] && users_db[username].password === password) {
-        req.session.regenerate((err) => {   // Issue new session ID before writing auth state
-            if (err) return res.status(500).send("Session error");
-            req.session.user = username;
-            return res.redirect('/dashboard');
-        });
-        return;
+    if (Object.hasOwn(users_db, username) && users_db[username].password === password) {
+        req.session.user = username;
+        return res.redirect('/dashboard');
     }
-
     return res.send("Invalid credentials! <a href='/login'>Try again</a>");
 });
 ```
 
 ### References
-
-- [OWASP Session Fixation](https://owasp.org/www-community/attacks/Session_fixation)
-- [CWE-384](https://cwe.mitre.org/data/definitions/384.html)
+- [CWE-1321: Prototype Pollution](https://cwe.mitre.org/data/definitions/1321.html)
+- [OWASP: Prototype Pollution Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Prototype_Pollution_Prevention_Cheat_Sheet.html)
 
 ---
 
-## Finding 5: Missing Security Headers
+## Finding 4: Missing CSRF Protection on Login Endpoint
 
-**File:** `main.js`  
-**Lines:** 1–16 (app setup)  
-**CWE:** CWE-693 — Protection Mechanism Failure  
-**OWASP Category:** A05:2021 – Security Misconfiguration  
-**Priority:** P3  
-**Severity:** LOW  
+**Finding ID:** `APPSEC-2e91f5d73a`
+**File:** `main.js`
+**Lines:** 17–36
+**CWE:** CWE-352 — Cross-Site Request Forgery
+**OWASP Category:** A01:2021 – Broken Access Control
+**Priority:** P2
+**Severity:** MEDIUM
 **Confidence:** HIGH
 
 ### Vulnerable Code
-
 ```javascript
-const express = require('express');
-const session = require('express-session');
-const app = express();
+app.get("/login", (req, res) => {
+    res.send(`<h1>Login</h1>
+        <form method='POST'>
+            ...
+        </form>
+    `);
+});
 
-app.use(express.urlencoded({ extended: true }));
-app.use(session({ secret: 'supersecretkey'}));
-// No helmet or security header middleware
+app.post("/login", (req, res) => {
+    const { username, password } = req.body;
+    if (users_db[username] && users_db[username].password === password) {
+        req.session.user = username;
+        return res.redirect('/dashboard');
+    }
 ```
 
 ### Description
-
-The application omits all standard HTTP security headers. Without `helmet` (or equivalent manual header setting), responses lack: `X-Content-Type-Options` (MIME-type sniffing protection), `X-Frame-Options`/`frame-ancestors` (clickjacking protection), `Content-Security-Policy` (XSS execution restriction), and `Strict-Transport-Security` (HSTS). The profile page at `main.js:60` also performs string interpolation of the username directly into an HTML response without output encoding — if username values ever come from user-controlled registration (not the case in this hardcoded DB, but relevant at scale), this would be a stored XSS vector.
+The `POST /login` endpoint performs no CSRF token validation. This enables a Login CSRF attack: an attacker hosts a page with a hidden auto-submitting form pointing to `/login` with the attacker's own credentials. When a victim (who may already be authenticated elsewhere on the domain, or whose session state the attacker wants to control) visits that page, they are silently logged into the attacker's account. In applications where post-login actions are tied to the account (e.g., stored payment methods, linked OAuth sessions), this allows the attacker to observe the victim's actions under the attacker's account.
 
 ### Prioritization
-
-P3. Defense-in-depth finding; no direct exploit path given current application behavior, but straightforward to fix.
+P2. Lower practical impact in this specific app (no post-login sensitive state tied to account), but Login CSRF is a well-documented real-world attack class and trivial to prevent.
 
 ### Exploitability Notes
-
-- **Exploit Preconditions:** Varies by header; clickjacking requires an attacker-controlled page embedding the app in an iframe
-- **Uncertainty Boundary:** Currently hardcoded usernames prevent XSS; dynamic usernames would elevate this
+- **Exploit Preconditions:** Attacker must have valid credentials for the application. Victim must visit attacker-controlled page.
+- **Uncertainty Boundary:** Impact depends on what authenticated users do after login; in this app it's limited to dashboard/profile views.
+- **Counterfactual invalidation:** Adding CSRF token validation (`csurf` middleware or equivalent) to `POST /login` eliminates this class.
 
 ### Remediation
-
 ```javascript
-const helmet = require('helmet'); // npm install helmet
+const csrf = require('csurf');
+const csrfProtection = csrf({ cookie: false }); // use session-bound token
 
-app.use(helmet()); // Sets X-Content-Type-Options, X-Frame-Options, CSP, HSTS, etc.
+app.get("/login", csrfProtection, (req, res) => {
+    res.send(`<h1>Login</h1>
+        <form method='POST'>
+            <input type='hidden' name='_csrf' value='${req.csrfToken()}'>
+            <label>Username:</label> <input type='text' name='username'><br>
+            <label>Password:</label> <input type='password' name='password'><br>
+            <button type='submit'>Login</button>
+        </form>
+    `);
+});
+
+app.post("/login", csrfProtection, (req, res) => { ... });
 ```
 
-Add `res.set("Cache-Control", "no-store")` to every authenticated route (see Finding 1 remediation).
-
 ### References
-
-- [helmet.js](https://helmetjs.github.io/)
-- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
+- [OWASP: CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [CWE-352](https://cwe.mitre.org/data/definitions/352.html)
 
 ---
 
-## Scan Summary
+## Finding 5: Insecure Session Cookie Configuration
+
+**Finding ID:** `APPSEC-9c6a47e82b`
+**File:** `main.js`
+**Lines:** 15
+**CWE:** CWE-614 — Sensitive Cookie in HTTPS Session Without 'Secure' Attribute / CWE-1004 — Sensitive Cookie Without 'HttpOnly' Flag
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P2
+**Severity:** MEDIUM
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.use(session({ secret: 'supersecretkey'}));
+```
+
+### Description
+The `express-session` call specifies only the `secret` field. Three critical cookie attributes are unset: `secure` (defaults to `false`) allows session cookies to be transmitted over plain HTTP, enabling network interception; `sameSite` is unset, allowing the cookie to be included in cross-origin requests (aiding CSRF); `resave` and `saveUninitialized` default to `true` in older versions, potentially creating sessions for unauthenticated requests and touching the store on every response. Additionally, no `maxAge` is set — sessions have no server-side expiry and persist for the process lifetime on the default MemoryStore. There is also no `/logout` route that calls `req.session.destroy()`, leaving users unable to invalidate their session.
+
+### Prioritization
+P2. Combined with the cleartext HTTP setup (no TLS enforced at nginx layer), the missing `secure` flag is immediately exploitable over the network.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network position to observe HTTP traffic (LAN, rogue WiFi, MitM).
+- **Uncertainty Boundary:** If TLS termination happens upstream of nginx and the service is only reachable over HTTPS in practice, `secure` omission is lower risk — but defense-in-depth still requires it.
+- **Counterfactual invalidation:** Setting `cookie: { secure: true, sameSite: 'strict', httpOnly: true, maxAge: 3600000 }` eliminates cookie interception and CSRF re-use via cookie inclusion.
+
+### Remediation
+```javascript
+app.use(session({
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: true,         // HTTPS only
+        httpOnly: true,       // no JS access
+        sameSite: 'strict',   // CSRF mitigation
+        maxAge: 60 * 60 * 1000 // 1-hour expiry
+    }
+}));
+
+// Add a logout handler
+app.get("/logout", (req, res) => {
+    req.session.destroy(err => {
+        res.clearCookie('connect.sid');
+        res.redirect('/login');
+    });
+});
+```
+
+### References
+- [CWE-614](https://cwe.mitre.org/data/definitions/614.html)
+- [OWASP: Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+
+---
+
+## Finding 6: Timing Attack on Password Comparison
+
+**Finding ID:** `APPSEC-1f7d4a8e3c`
+**File:** `main.js`
+**Lines:** 30
+**CWE:** CWE-208 — Observable Timing Discrepancy
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P3
+**Severity:** LOW
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+if (users_db[username] && users_db[username].password === password) {
+```
+
+### Description
+JavaScript's `===` operator short-circuits on the first mismatched byte, leaking timing information. An attacker making many login requests with differing passwords can statistically measure response time differences to determine how many leading characters of their guess are correct, enabling a byte-by-byte password oracle. The impact is limited by network jitter and the fact that passwords are stored in plaintext (removing the timing oracle advantage once you can hash-compare), but the pattern is textbook CWE-208.
+
+### Prioritization
+P3. Practically difficult to exploit over a real network due to jitter. Highest-priority remediation is switching to bcrypt (Finding 2), which makes this moot.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must make a high volume of login requests and collect sufficient statistical samples to overcome network noise.
+- **Uncertainty Boundary:** Over LAN or loopback, signal-to-noise ratio increases and practical exploitation becomes more feasible.
+- **Counterfactual invalidation:** Switching password storage to bcrypt and comparing with `bcrypt.compare()` removes the timing oracle entirely.
+
+### Remediation
+```javascript
+const crypto = require('crypto');
+
+// Temporary fix (until bcrypt is implemented):
+if (users_db[username] && crypto.timingSafeEqual(
+    Buffer.from(users_db[username].password),
+    Buffer.from(password)
+)) {
+    req.session.user = username;
+    return res.redirect('/dashboard');
+}
+```
+
+Long-term: store bcrypt hashes and use `bcrypt.compare()` — which is inherently timing-safe.
+
+### References
+- [CWE-208](https://cwe.mitre.org/data/definitions/208.html)
+- [Timing Attacks on HMAC – sockpuppet.org](http://sockpuppet.org/blog/2014/02/25/safely-generate-random-numbers/)
+
+---
+
+## Finding 7: Unescaped User-Controlled Data in HTML Response
+
+**Finding ID:** `APPSEC-3b2c9f6d7e`
+**File:** `main.js`
+**Lines:** 60
+**CWE:** CWE-79 — Improper Neutralization of Input During Web Page Generation (XSS)
+**OWASP Category:** A03:2021 – Injection
+**Priority:** P3
+**Severity:** INFO
+**Confidence:** LOW
+
+### Vulnerable Code
+```javascript
+res.send(`${user} - API Key: ${api_key}`);
+```
+
+### Description
+`user` originates from `req.session.user`, which was set from `req.body.username` at login. Neither value is HTML-escaped before insertion into the response. In the current hardcoded `users_db`, `user` can only be `"admin"`, making this unexploitable today. However, the pattern is architecturally unsafe: any future user registration path that allows arbitrary usernames would introduce stored XSS through this sink. Rated INFO due to current non-exploitability with the hardcoded data model.
+
+### Prioritization
+P3 / INFO. Not exploitable in the current code. Remediating Finding 1 (Web Cache Deception) and 2 (Hardcoded Data) are far higher priority.
+
+### Exploitability Notes
+- **Exploit Preconditions:** A user with an HTML/JS payload in their username must exist in `users_db`.
+- **Uncertainty Boundary:** Depends entirely on how user registration is implemented if added.
+- **Counterfactual invalidation:** HTML-escaping `user` and `api_key` before interpolation eliminates this sink.
+
+### Remediation
+```javascript
+const escapeHtml = s => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+
+res.send(`${escapeHtml(user)} - API Key: ${escapeHtml(api_key)}`);
+// Or use a template engine with auto-escaping (e.g., EJS, Handlebars)
+```
+
+### References
+- [CWE-79](https://cwe.mitre.org/data/definitions/79.html)
+- [OWASP: XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
+
+---
 
 ```
 ## Scan Summary
@@ -353,23 +450,22 @@ Add `res.set("Cache-Control", "no-store")` to every authenticated route (see Fin
 | Metric          | Value |
 |-----------------|-------|
 | Files Analyzed  | 5     |
-| Total Findings  | 5     |
+| Total Findings  | 7     |
 | Critical        | 1     |
-| High            | 2     |
-| Medium          | 1     |
+| High            | 1     |
+| Medium          | 3     |
 | Low             | 1     |
-| Info            | 0     |
+| Info            | 1     |
 
 ### Key Risks
-The dominant risk is a textbook Web Cache Deception attack: Nginx's
-extension-based cache rule combined with Express's wildcard `/profile*`
-route allows any attacker to steal authenticated users' API keys from a
-shared cache with no session required. This is compounded by hardcoded
-plaintext credentials and a hardcoded session secret, meaning source
-code access alone is sufficient to forge sessions or extract credentials
-without any network interaction.
+The dominant risk is Web Cache Deception (Finding 1): nginx caches responses for URL extensions
+like `.css` without including cookies in the cache key, and Express's wildcard `/profile*` route
+serves authenticated API keys for any path starting with `/profile` — including `/profile.css`.
+This allows an unauthenticated attacker to steal a logged-in user's API key with a single primed
+URL, requiring no credentials. Hardcoded secrets (Finding 2) compound the risk: a known session
+secret allows direct session cookie forgery, while the plaintext password and hardcoded API key
+are trivially extracted from source control.
 ```
 
 ### Prioritization Notes
-
-Findings 1–3 are all P1 because each offers a direct, low-precondition path to credential or session compromise. Finding 1 is the most operationally dangerous (external attacker, no source access required); Findings 2–3 are equally damaging but require repo access. Fix all three together; they share a common remediation theme of "move secrets out of source and add `Cache-Control: no-store` to authenticated responses."
+Findings are ordered by practical exploitability and impact. Finding 1 (Web Cache Deception) is immediately exploitable with zero authentication and yields full API key exfiltration — it should be patched first by adding `Cache-Control: no-store` to the `/profile*` handler and replacing the wildcard route with an exact match. Finding 2 (Hardcoded Secrets) requires source access but enables session forgery; rotate all secrets and move them to environment variables in the same sprint. Findings 3–5 (prototype bypass, CSRF, session config) are medium-risk and addressable in a single pass of the authentication/session logic.

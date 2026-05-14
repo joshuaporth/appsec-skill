@@ -1,5 +1,5 @@
 Challenge: 17
-Primary intended issue: OS Command Injection via unsanitized user input passed through `sh -c` to the `ping` command.
+Primary intended issue: OS Command Injection via unsanitized user input passed through `sh -c` to the ping command.
 Verdict: correct
-Rationale: The findings correctly identify and fully describe the OS Command Injection (CWE-78) at the exact vulnerable line, explain the shell-metacharacter exploitation mechanics, and recommend both avoiding `sh -c` and adding IP validation — matching all three remediation strategies outlined in the solution.
-Bonus findings: Valid secondary issues noted: container running as root (CWE-250) and error details leaked to client (CWE-209).
+Rationale: The findings correctly identify CWE-78 OS Command Injection as the critical primary issue at `main.go:19`, precisely matching the solution's intended vulnerability, and even proposes the same two core remediations — using the ping binary directly without a shell and applying strict input validation.
+Bonus findings: Valid secondary issues noted include missing authentication (CWE-306), sensitive error disclosure (CWE-209), and container running as root (CWE-250) — all consistent with the solution's third point about minimal privileges.

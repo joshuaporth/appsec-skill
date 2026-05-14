@@ -1,5 +1,5 @@
 Challenge: 14
-Primary intended issue: Race condition (TOCTOU) on the fund transfer endpoint where the balance check and debit are separate non-atomic operations, allowing concurrent requests to bypass the insufficient-funds guard.
+Primary intended issue: A race condition (TOCTOU) between the balance check and the transfer updates allows concurrent requests to bypass the insufficient-funds check and overdraw an account (double-spend).
 Verdict: correct
-Rationale: Finding 1 in the findings artifact precisely identifies the race condition / TOCTOU on the transfer endpoint, explains the concurrent-request exploit mechanic (multiple requests passing the balance check before any debit commits), and recommends database transactions as the fix — exactly matching the solution's intended vulnerability and mitigation.
-Bonus findings: Missing authentication (CWE-306), IDOR on `from` account (CWE-862), silent fund destruction on invalid `to` account, missing security headers, and swallowed DB errors — all valid secondary issues.
+Rationale: Finding 2 in the findings artifact precisely identifies the TOCTOU race condition — concurrent requests reading the same balance before either UPDATE fires — and proposes the same database-transaction mitigation described in the solution.
+Bonus findings: Missing authentication (Finding 1), silent fund destruction on invalid `to` account (Finding 3), and NaN/Infinity input validation bypass (Finding 4) are all valid additional issues not covered by the solution.

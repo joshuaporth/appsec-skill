@@ -1,119 +1,114 @@
-Now I have everything I need. Let me perform the three-pass analysis.
+All references loaded. Now performing the three-pass review.
 
 ---
 
 ## Pass 1 — Triage
 
-**Language/Framework:** Java, Spring Boot, Spring JDBC (`JdbcTemplate`)
-
-**Entry Points:**
-- `GET /users` — `orderBy` query parameter → SQL ORDER BY clause
-- `POST /users` — `username` query parameter → SQL INSERT
-
-**Trust Boundaries:**
-- Both parameters are fully attacker-controlled HTTP request params
-- No authentication, authorization, or session management visible
-- No input validation or allowlisting present
-
-**Sensitive Operations:**
-- Direct JDBC queries via `JdbcTemplate`
-- Unparameterized string concatenation at line 25
+- **Language/Framework:** Java 8+, Spring Boot, Spring JDBC (`JdbcTemplate`)
+- **Entry points:**
+  - `GET /users?orderBy=<user-controlled>` — returns all user rows
+  - `POST /users?username=<user-controlled>` — inserts a new user
+- **Trust boundaries:** Both `@RequestParam` values come directly from HTTP requests — fully attacker-controlled
+- **Sensitive operations:** Two SQL operations, one via string concatenation, one via parameterized placeholder
+- **No Spring Security import or auth middleware visible in scope**
 
 ---
 
 ## Pass 2 — Deep Scan
 
-**SQLi at line 25:** `orderBy` is concatenated raw into `ORDER BY`. ORDER BY clauses cannot be parameterized in JDBC (column names aren't bind variables), so this is exploitable as-is.
+**`GET /users` (line 25):** `orderBy` is concatenated into raw SQL — classic SQLi sink.
 
-**Auth gap:** No `@PreAuthorize`, no `SecurityContext` checks, no Spring Security filter visible. Both endpoints are anonymously accessible.
+**`POST /users` (lines 31–32):** Uses `?` placeholder with `jdbcTemplate.update()` — parameterized and safe.
 
-**`addUser()` at line 31–32:** Uses `?` placeholder — correctly parameterized, no SQLi.
+**Auth:** No authentication or authorization annotations/guards visible on either endpoint. Spring Security config is not in scope, so confidence is lowered, but both endpoints perform privileged database operations.
 
 ---
 
 ## Pass 3 — Validation
 
-**SQLi:** Unambiguously reachable (public GET, no gating). Attacker input `?orderBy=(SELECT password FROM admin LIMIT 1)` reaches the SQL sink directly. Counterfactual: adding a strict allowlist of column names would invalidate this finding. No sanitization missed. **VALID — P1 CRITICAL.**
+**SQLi:** Fully reachable, no sanitization, no allowlist, `ORDER BY` injection has well-documented data-exfiltration techniques — confirmed HIGH.
 
-**Missing auth:** Could be handled by Spring Security in another file not in scope — confidence MEDIUM. But no evidence of it. Impact is high (all user data exposed, arbitrary users insertable). **VALID — P2 HIGH.**
+**Missing auth:** No evidence of Spring Security or equivalent in scope. Flagging with MEDIUM confidence given missing config context.
 
 ---
 
-## Finding 1: SQL Injection (ORDER BY Clause)
+## Finding 1: SQL Injection via ORDER BY String Concatenation
 
+**Finding ID:** `APPSEC-c3a7f82d91`
 **File:** `main.java`
-**Lines:** 24–26
-**CWE:** CWE-89 — Improper Neutralization of Special Elements in an SQL Command
+**Lines:** 25–26
+**CWE:** CWE-89 — Improper Neutralization of Special Elements used in an SQL Command
 **OWASP Category:** A03:2021 – Injection
 **Priority:** P1
-**Severity:** CRITICAL
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
 ```java
-@GetMapping("/users")
-public List<Map<String, Object>> getUsers(@RequestParam String orderBy) {
-    String query = "SELECT * FROM users ORDER BY " + orderBy;
-    return jdbcTemplate.queryForList(query);
-}
+String query = "SELECT * FROM users ORDER BY " + orderBy;
+return jdbcTemplate.queryForList(query);
 ```
 
 ### Description
-The `orderBy` request parameter is concatenated directly into the SQL query string with no validation, allowlisting, or escaping. Because `ORDER BY` expressions cannot use JDBC bind parameters (the driver treats bound values as string literals, not SQL identifiers), there is no safe parameterization shortcut here — the fix requires an explicit allowlist. An attacker who controls `orderBy` can inject arbitrary SQL, including subqueries that exfiltrate data from any table, UNION-based cross-table reads, or time-based blind extraction. Depending on the database and its configuration, this could escalate to OS command execution (e.g., MySQL `INTO OUTFILE`, MSSQL `xp_cmdshell`).
+The `orderBy` request parameter is appended directly to the SQL string via string concatenation before being executed with `JdbcTemplate.queryForList()`. Column names cannot be bound with standard JDBC placeholders, so developers sometimes reach for concatenation here — but the value is never validated against an allowlist of permitted columns. An attacker controls the entire SQL fragment after `ORDER BY`, enabling error-based, time-based blind, and UNION-based extraction techniques against any table the DB user can read. On most databases this is also a vector for stacked-query injection depending on the driver and DB config.
 
 ### Prioritization
-Highest-priority finding. Directly reachable by any unauthenticated caller (no auth gate visible), full database read access with no preconditions, and the data flow from attacker input to SQL sink is one line with zero defenses.
+This is the highest-priority finding. The source-to-sink path is direct and unambiguous (`@RequestParam` → string concat → `queryForList`), requires zero authentication, and is reachable from the public internet on the `GET /users` endpoint.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** The endpoint must be reachable on the network. No authentication or other gating is visible in scope.
-- **Uncertainty Boundary:** If Spring Security is configured in an out-of-scope file and restricts access to authenticated users only, the precondition becomes "authenticated user" — still exploitable but a lower attacker population.
+- **Exploit Preconditions:** Attacker can send an HTTP GET request to `/users`. No authentication is visible in scope. Even if auth were added, the bug would remain.
+- **Uncertainty Boundary:** The specific DB engine determines which exploitation techniques work (e.g., `SLEEP()` on MySQL vs `pg_sleep()` on PostgreSQL vs `WAITFOR DELAY` on MSSQL), but SQLi is valid regardless of backend.
 
-**Concrete attacker input shapes:**
+**Concrete attacker input examples:**
 ```
-GET /users?orderBy=username,(SELECT+password+FROM+admin_users+LIMIT+1)--
-GET /users?orderBy=(SELECT+SLEEP(5))--
-GET /users?orderBy=1+UNION+SELECT+table_name,null+FROM+information_schema.tables--
+GET /users?orderBy=1 UNION SELECT null,username,password,null FROM users--
+GET /users?orderBy=(SELECT CASE WHEN (1=1) THEN 1 ELSE 2 END)
+GET /users?orderBy=1;DROP TABLE users--
 ```
 
-**Counterfactual invalidation:** If `orderBy` is checked against a strict allowlist (`Set.of("id", "username")`) and the request is rejected for any other value, this finding is invalid.
+**Counterfactual invalidation:** If `orderBy` were validated against a strict allowlist of known column names before query construction (e.g., `Set.of("id","username","email")`), this finding would be invalid.
 
 ### Remediation
-`ORDER BY` column names cannot be bound via `PreparedStatement`. The correct fix is an explicit allowlist of permitted column names validated before the query is built:
+Column names cannot be bound as JDBC parameters, so the correct fix is an explicit allowlist before query construction:
 
 ```java
-private static final Set<String> ALLOWED_ORDER_COLUMNS = Set.of("id", "username");
+private static final Set<String> ALLOWED_ORDER_COLUMNS = Set.of("id", "username", "email", "created_at");
 
 @GetMapping("/users")
 public List<Map<String, Object>> getUsers(@RequestParam String orderBy) {
     if (!ALLOWED_ORDER_COLUMNS.contains(orderBy)) {
-        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid orderBy parameter");
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid sort column");
     }
+    // orderBy is now a validated, safe identifier — concatenation is acceptable
     String query = "SELECT * FROM users ORDER BY " + orderBy;
     return jdbcTemplate.queryForList(query);
 }
 ```
 
-To also allow sort direction, extend the pattern:
-```java
-private static final Set<String> ALLOWED_COLUMNS = Set.of("id", "username");
-private static final Set<String> ALLOWED_DIRECTIONS = Set.of("ASC", "DESC");
+If the column names are dynamic and an allowlist is impractical, map client-supplied sort keys to server-side column names:
 
-// validate both column and direction from request params before concatenating
+```java
+private static final Map<String, String> SORT_COLUMN_MAP = Map.of(
+    "name", "username",
+    "date", "created_at"
+);
+
+String col = SORT_COLUMN_MAP.get(orderBy);
+if (col == null) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid sort column");
+String query = "SELECT * FROM users ORDER BY " + col;
 ```
 
-This treats `orderBy` as a key into a controlled map, ensuring no attacker-supplied token ever reaches the SQL string.
-
 ### References
-- https://owasp.org/www-community/attacks/SQL_Injection
 - https://cwe.mitre.org/data/definitions/89.html
-- https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+- https://owasp.org/www-community/attacks/SQL_Injection
 
 ---
 
-## Finding 2: Missing Authentication on All Endpoints
+## Finding 2: No Authentication or Authorization on Database Endpoints
 
+**Finding ID:** `APPSEC-7b2e4a91c0`
 **File:** `main.java`
-**Lines:** 23–33
+**Lines:** 23–34
 **CWE:** CWE-306 — Missing Authentication for Critical Function
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P2
@@ -124,76 +119,76 @@ This treats `orderBy` as a key into a controlled map, ensuring no attacker-suppl
 ```java
 @GetMapping("/users")
 public List<Map<String, Object>> getUsers(@RequestParam String orderBy) {
-    String query = "SELECT * FROM users ORDER BY " + orderBy;
-    return jdbcTemplate.queryForList(query);
+    ...
 }
 
 @PostMapping("/users")
 public String addUser(@RequestParam String username) {
-    String query = "INSERT INTO users (username) VALUES (?)";
-    jdbcTemplate.update(query, username);
-    return "User added successfully";
+    ...
 }
 ```
 
 ### Description
-Neither endpoint performs any authentication or authorization check within the controller. `GET /users` returns the full contents of the `users` table to any caller, exposing all stored usernames. `POST /users` allows any caller to insert a new user record with an arbitrary username, with no ownership or privilege verification. These are sensitive data-manipulation operations that require identity verification before execution.
+Neither endpoint carries any authentication or authorization guard. `GET /users` returns the full `users` table to any caller. `POST /users` permits any unauthenticated caller to insert arbitrary usernames. No Spring Security configuration, JWT validation, or session check is visible in the analyzed scope. In the absence of a broader security config, any internet-reachable deployment of this service exposes all user records and allows unrestricted account creation.
 
 ### Prioritization
-Second-highest priority. While auth controls may exist in an out-of-scope Spring Security configuration file, the absence of any evidence of such controls (no `@PreAuthorize`, no `SecurityContextHolder`, no visible security config) makes this a credible gap. The combined risk with Finding 1 — unauthenticated access plus unrestricted SQL injection — represents full database compromise for anonymous internet callers.
+P2 — ranks below the confirmed SQLi (P1) because the impact here depends on what the `users` table contains and whether Spring Security is configured elsewhere. The SQLi has a certain, direct exploit path regardless of auth state.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** The service must be network-accessible. No credentials, cookies, or tokens are required based on visible code.
-- **Uncertainty Boundary:** Spring Security or a gateway-layer policy not visible in this file could require authentication. Confidence is MEDIUM for this reason.
+- **Exploit Preconditions:** Service is deployed without an external auth gateway or a Spring Security configuration bean that is not visible in this file.
+- **Uncertainty Boundary:** A `SecurityFilterChain` bean in another class or a gateway-level auth policy not in scope could mitigate this. Confidence is MEDIUM for that reason.
 
 ### Remediation
-Add Spring Security and apply method-level security:
+Add Spring Security and require authentication for both endpoints. Minimal example:
 
 ```java
-// pom.xml — add dependency
-// <dependency>
-//   <groupId>org.springframework.boot</groupId>
-//   <artifactId>spring-boot-starter-security</artifactId>
-// </dependency>
+// SecurityConfig.java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
 
-@GetMapping("/users")
-@PreAuthorize("isAuthenticated()")
-public List<Map<String, Object>> getUsers(@RequestParam String orderBy) { ... }
-
-@PostMapping("/users")
-@PreAuthorize("hasRole('ADMIN')")
-public String addUser(@RequestParam String username) { ... }
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/users").authenticated()
+                .anyRequest().denyAll()
+            )
+            .httpBasic(Customizer.withDefaults()); // or JWT/OAuth2
+        return http.build();
+    }
+}
 ```
 
-Enable `@EnableMethodSecurity` in a `@Configuration` class. For `GET /users`, at minimum require authentication; for `POST /users`, restrict to an administrator role given it modifies persistent state.
+For the `POST /users` endpoint, also verify that only privileged roles (e.g., `ROLE_ADMIN`) may create users:
+
+```java
+.requestMatchers(HttpMethod.POST, "/users").hasRole("ADMIN")
+.requestMatchers(HttpMethod.GET,  "/users").authenticated()
+```
 
 ### References
-- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
 - https://cwe.mitre.org/data/definitions/306.html
-- https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html
+- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
 
 ---
 
 ```
 ## Scan Summary
 
-| Metric         | Value |
-|----------------|-------|
-| Files Analyzed | 1     |
-| Total Findings | 2     |
-| Critical       | 1     |
-| High           | 1     |
-| Medium         | 0     |
-| Low            | 0     |
-| Info           | 0     |
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 1     |
+| Total Findings  | 2     |
+| Critical        | 0     |
+| High            | 2     |
+| Medium          | 0     |
+| Low             | 0     |
+| Info            | 0     |
 
 ### Key Risks
-The single critical finding (ORDER BY SQL injection) is directly reachable with no preconditions visible in scope,
-giving any network caller arbitrary SQL execution against the database. Combined with the missing authentication
-finding, the effective attack surface is fully open: anonymous callers can enumerate and exfiltrate all database
-content and insert arbitrary records. Remediate the SQLi with a column allowlist (one-line change) and add Spring
-Security authentication gating before any other work.
+The most immediate risk is the ORDER BY SQL injection (P1): a single unauthenticated HTTP request can exfiltrate the entire `users` table or, depending on DB configuration, any other table the service account can read. The missing authentication finding (P2) compounds this — both endpoints are fully open, meaning the SQLi requires zero preconditions and the full user roster is directly readable without any injection at all.
 ```
 
 ### Prioritization Notes
-Finding 1 (SQLi) ranks above Finding 2 (auth) because it has a direct, one-request exploit path with HIGH confidence and no uncertainty about the sink. Finding 2 is rated MEDIUM confidence because authentication may be enforced by out-of-scope Spring Security config; however, the two findings are compounding — resolving auth without fixing the SQLi still leaves authenticated users able to inject SQL.
+P1 is ordered first because the SQLi sink is confirmed with direct source-to-sink evidence and zero preconditions. P2 is ranked below it because a Spring Security config outside this file could exist — but if no auth config is present, P2 escalates to equal severity since the data is readable without any injection.
