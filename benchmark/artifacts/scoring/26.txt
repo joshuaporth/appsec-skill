@@ -1,5 +1,5 @@
 Challenge: 26
-Primary intended issue: Prototype pollution via the unsafe `merge()` function allowing an attacker to pollute `Object.prototype` through the `/update-profile` endpoint and gain admin access.
+Primary intended issue: Prototype Pollution via the unfiltered custom `merge()` function on the `/update-profile` endpoint, allowing `__proto__` injection to escalate a guest user to admin.
 Verdict: correct
-Rationale: Finding 1 in the findings artifact precisely identifies the prototype pollution vulnerability in `merge()` at `/update-profile`, correctly explains the `__proto__` cookie bypass of the auth check, and provides a concrete matching exploit payload — fully aligned with the solution's intended primary issue.
-Bonus findings: Mass assignment / direct `isAdmin` injection (the solution's own "unintended 2nd solution"), unsigned cookie impersonation, password leakage in response, missing CSRF protection, and missing security headers are all valid extras.
+Rationale: Finding 1 in the findings artifact precisely identifies the prototype pollution vulnerability in `merge()`, correctly describes the `__proto__` injection mechanism, the `/update-profile` endpoint as the attack vector, and the guest-to-admin escalation path — fully matching the solution's intended primary issue.
+Bonus findings: Mass assignment (direct `isAdmin` write via merge, matching the unintended 2nd solution), plaintext password storage, missing cookie security attributes, and `NODE_ENV=development` misconfiguration are all valid extras.

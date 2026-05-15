@@ -1,5 +1,5 @@
 Challenge: 22
-Primary intended issue: Eval Injection — untrusted user input passed directly to `eval()` enabling arbitrary command execution.
+Primary intended issue: Eval Injection (arbitrary code execution via `eval()` on unsanitized user-controlled input at the `/process-data` endpoint)
 Verdict: correct
-Rationale: Finding 1 in the findings artifact precisely identifies the `eval(data)` call on `req.body.data` as an unauthenticated RCE, provides the identical exploit payload (`require('child_process').execSync(...)`) shown in the solution, and recommends removing `eval()` entirely — matching the solution's primary issue on every dimension.
-Bonus findings: Hardcoded plaintext credentials (CWE-798/256), missing session token issuance, timing side-channel on credential comparison, and missing HTTP security headers — all valid secondary findings.
+Rationale: Finding 1 in the frozen artifact precisely identifies `eval(data)` on attacker-controlled `req.body.data` as unauthenticated RCE (CWE-94), includes the same exploit payload pattern shown in the solution (`require('child_process').execSync(...)`), and recommends removing `eval()` — fully aligned with the solution's primary issue.
+Bonus findings: Valid secondary issues reported: missing authentication (CWE-306), hardcoded plaintext credentials (CWE-798/CWE-256), and timing-safe comparison absence (CWE-208).

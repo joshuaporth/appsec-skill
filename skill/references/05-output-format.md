@@ -6,6 +6,7 @@ Every finding must follow this exact structure. No field may be omitted.
 
 ## Finding [N]: [Vulnerability Class]
 
+**Finding ID:** `APPSEC-[stable-id]`
 **File:** `path/to/file.ext`
 **Lines:** [start]–[end]
 **CWE:** CWE-[ID] — [Name]
@@ -61,6 +62,39 @@ and confidence. If not top priority, briefly note higher-priority findings.]
 
 ### Prioritization Notes (optional)
 [Optional: 1-2 sentences explaining why findings are ordered this way (exploitability, impact, confidence).]
+
+## Stable Finding IDs
+
+Use a deterministic finding ID so reviews can be diffed across reruns and pull requests.
+
+Recommended construction:
+
+1. Start with the repository-relative file path.
+2. Append the CWE id.
+3. Append a normalized form of the vulnerable sink snippet (collapse whitespace; keep key function/operator names).
+4. Hash that combined string with a stable hash (for example SHA-1 or SHA-256) and keep the first 10-12 hex characters.
+5. Emit the final value as `APPSEC-<hash>`.
+
+Guidance:
+
+- The same issue in the same file should keep the same ID across wording changes in the report.
+- If the vulnerable sink or file path materially changes, a new ID is acceptable.
+- Never invent a random UUID for a finding; the ID must be reproducible from the evidence.
+
+## Optional SARIF Mapping
+
+When a downstream tool needs SARIF, preserve the human report above and map fields as follows:
+
+| Report field | SARIF field |
+|--------------|-------------|
+| `Finding ID` | `partialFingerprints.primaryLocationLineHash` or `fingerprints.appsecFindingId` |
+| `CWE` | `ruleId` and `taxa` |
+| `Severity` | `level` (`error` for CRITICAL/HIGH, `warning` for MEDIUM, `note` for LOW/INFO) |
+| `Description` | `message.text` |
+| `File` + `Lines` | `locations[0].physicalLocation.artifactLocation.uri` and `region` |
+| `OWASP Category`, `Confidence`, `Priority` | `properties.tags`, `properties.confidence`, `properties.priority` |
+
+If emitting SARIF alongside markdown, keep the markdown report as the source of truth for defenders and use the deterministic finding ID to deduplicate results between formats.
 
 ## Confidence Levels
 

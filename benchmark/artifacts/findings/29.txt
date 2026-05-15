@@ -1,38 +1,242 @@
-I have all files. Running the three-pass analysis now.
+I have all the information I need. Now I'll perform the full three-pass analysis and produce the structured report.
 
 ---
 
-## Pass 1 — Triage
+## Pass 1 — Triage (Internal)
 
-**Stack:** Python 3 / Flask 2.3.3 / Flask-SQLAlchemy 3.1.1 / SQLite / Docker
-
-**Entry points:**
-- `GET /` — static template
-- `POST /invoices` — JSON body: `customer_name`, `billing_address`, `vat_id`, `description`
-- `GET /invoices` — no params
-- `POST /pay/<int:invoice_id>` — URL param only
-
-**Trust boundaries:** Every request field is fully attacker-controlled; no authentication layer exists anywhere. The comment on `main.py:66` ("imagine proper authentication and authorization to be in place") confirms the intent — the code does not implement it.
-
-**Sensitive operations:** DB writes, payment-state mutation, retrieval of all records.
+**Stack:** Python 3.11, Flask 2.3.3, Flask-SQLAlchemy 3.1.1, SQLite  
+**Entry points:** `GET /`, `POST /invoices`, `GET /invoices`, `POST /pay/<int:invoice_id>`  
+**Trust boundaries:** `request.json` — fully attacker-controlled; `invoice_id` in URL — attacker-controlled (cast to `int` by Flask)  
+**Sensitive operations:** ORM model construction from user data (`Invoice(**data)`), payment state mutation, full invoice table dump  
+**No authentication or authorization middleware present on any route**
 
 ---
 
-## Pass 2 — Deep Scan findings
-
-Five issues validated. Ordered below by pass-3 risk score.
+## Security Review Findings
 
 ---
 
-## Finding 1: Missing Authentication and Authorization (IDOR)
+## Finding 1: Mass Assignment — Security-Sensitive `paid` Field Writable From Client
 
-**File:** `main.py`
-**Lines:** 51–54, 56–63
-**CWE:** CWE-862 — Missing Authorization
-**OWASP Category:** A01:2021 – Broken Access Control
-**Priority:** P1
-**Severity:** CRITICAL
-**Confidence:** HIGH
+**Finding ID:** `APPSEC-8c3fa12e91`  
+**File:** `main.py`  
+**Lines:** 41–45  
+**CWE:** CWE-915 — Improperly Controlled Modification of Dynamically-Determined Object Attributes  
+**OWASP Category:** A03:2021 – Injection / A01:2021 – Broken Access Control  
+**Priority:** P1  
+**Severity:** HIGH  
+**Confidence:** HIGH  
+
+### Vulnerable Code
+```python
+def create_invoice():
+    data = request.json or {}
+
+    # Amount is server-controlled (e.g., from the authenticated user's plan/contract)
+    data["amount"] = get_amount_for_current_user()
+    invoice = Invoice(**data)
+```
+
+### Description
+The `create_invoice` handler reads the entire JSON request body into `data`, overwrites only `amount` with a server-side value, then passes the full dict as keyword arguments to the `Invoice` ORM constructor. The `Invoice` model has a `paid` boolean column (line 18, default `False`) that is never explicitly set server-side. An attacker can include `"paid": true` in the POST body — after `amount` is overwritten the key survives — and the SQLAlchemy model will accept it, persisting an invoice that is permanently pre-marked as paid without any real payment having occurred. The developer comment calls out amount as "server-controlled" but does not protect the equally sensitive `paid` field, making this a targeted oversight.
+
+Attacker-controlled input shape:
+```json
+POST /invoices
+{"customer_name":"evil","billing_address":"1 Free St","vat_id":"XX000","description":"free","paid":true}
+```
+
+Result: new row inserted with `paid = 1`, bypassing all payment logic.
+
+### Prioritization
+This is the highest-priority finding. It enables direct financial fraud (invoices created pre-paid without payment) with no preconditions beyond the ability to send an HTTP POST. The impact is concrete and the exploit is trivial.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must be able to reach `POST /invoices`. No authentication is enforced (see Finding 2), so this is unauthenticated by default.
+- **Uncertainty Boundary:** If a separate middleware layer validates and strips unknown/forbidden fields before this handler runs, exploitability would be reduced — but no such layer is visible in scope.
+
+### Counterfactual Invalidation
+If `invoice = Invoice(**data)` were replaced with explicit field extraction *and* `paid` were hard-coded server-side, this finding would not be valid.
+
+### Remediation
+Explicitly map only allowlisted, non-sensitive fields from the request, and set security-sensitive state fields server-side unconditionally:
+
+```python
+@app.route("/invoices", methods=["POST"])
+def create_invoice():
+    data = request.json or {}
+
+    invoice = Invoice(
+        customer_name=data.get("customer_name"),
+        billing_address=data.get("billing_address"),
+        vat_id=data.get("vat_id"),
+        description=data.get("description"),
+        amount=get_amount_for_current_user(),  # server-controlled
+        paid=False,                            # server-controlled; never from client
+    )
+
+    db.session.add(invoice)
+    db.session.commit()
+    return jsonify(invoice.to_dict()), 201
+```
+
+This approach ensures that regardless of what keys the client supplies, only the explicitly named fields are accepted, and `paid` (and `amount`) are always server-determined.
+
+### References
+- https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+- https://cwe.mitre.org/data/definitions/915.html
+
+---
+
+## Finding 2: Missing Authentication on All Endpoints
+
+**Finding ID:** `APPSEC-2d9b47c051`  
+**File:** `main.py`  
+**Lines:** 39–63  
+**CWE:** CWE-306 — Missing Authentication for Critical Function  
+**OWASP Category:** A07:2021 – Identification and Authentication Failures  
+**Priority:** P1  
+**Severity:** HIGH  
+**Confidence:** HIGH  
+
+### Vulnerable Code
+```python
+@app.route("/invoices", methods=["POST"])
+def create_invoice():
+    data = request.json or {}
+    ...
+
+@app.route("/invoices", methods=["GET"])
+def list_invoices():
+    invoices = Invoice.query.all()
+    ...
+
+@app.route("/pay/<int:invoice_id>", methods=["POST"])
+def mark_invoice_paid(invoice_id):
+    invoice = Invoice.query.get_or_404(invoice_id)
+    invoice.paid = True
+    ...
+```
+
+### Description
+None of the three state-changing or data-access routes enforce any authentication check — no session cookie validation, no bearer token check, no `@login_required` decorator, and no before-request guard. The comment at line 67 ("imagine proper authentication and authorization to be in place") is a developer note about intent, not an implemented control. Any unauthenticated HTTP client can create invoices, retrieve every invoice record in the database (including PII), and mark arbitrary invoices as paid.
+
+### Prioritization
+P1 alongside Finding 1. Without authentication, all other access control findings are trivially exploitable by any network-adjacent attacker, not just authenticated users.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to port 5000. No credentials required.
+- **Uncertainty Boundary:** An upstream reverse proxy or API gateway could enforce auth before requests reach Flask. None is visible in scope; `docker-compose.yml` exposes port 5000 directly.
+
+### Counterfactual Invalidation
+Adding a `@login_required` decorator (or equivalent before-request check) to each route, or a global `before_request` guard, would eliminate the unauthenticated access vector.
+
+### Remediation
+Use Flask-Login or a JWT middleware and protect every sensitive route:
+
+```python
+from functools import wraps
+from flask import session, abort
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            abort(401)
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/invoices", methods=["POST"])
+@login_required
+def create_invoice():
+    ...
+
+@app.route("/invoices", methods=["GET"])
+@login_required
+def list_invoices():
+    ...
+
+@app.route("/pay/<int:invoice_id>", methods=["POST"])
+@login_required
+def mark_invoice_paid(invoice_id):
+    ...
+```
+
+### References
+- https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
+- https://cwe.mitre.org/data/definitions/306.html
+
+---
+
+## Finding 3: IDOR — No Object-Level Authorization on Pay Endpoint
+
+**Finding ID:** `APPSEC-f1a83e7c24`  
+**File:** `main.py`  
+**Lines:** 56–63  
+**CWE:** CWE-862 — Missing Authorization  
+**OWASP Category:** A01:2021 – Broken Access Control  
+**Priority:** P2  
+**Severity:** HIGH  
+**Confidence:** HIGH  
+
+### Vulnerable Code
+```python
+@app.route("/pay/<int:invoice_id>", methods=["POST"])
+def mark_invoice_paid(invoice_id):
+    invoice = Invoice.query.get_or_404(invoice_id)
+
+    # Imagine some proper payment logic here ...
+    invoice.paid = True
+    db.session.commit()
+    return jsonify({"message": f"Invoice {invoice_id} marked as paid."})
+```
+
+### Description
+The handler fetches the invoice by its integer ID taken directly from the URL path and marks it paid without verifying that the authenticated caller owns or is authorized to act on that invoice. In a multi-tenant deployment, any authenticated user who can guess or enumerate a sequential integer ID can mark any other tenant's invoice as paid — potentially clearing legitimate outstanding debt or triggering false business-logic completion. Invoice IDs are sequential integers (SQLite auto-increment), making enumeration trivial (`/pay/1`, `/pay/2`, …).
+
+Attacker payload: `POST /pay/42` marks invoice 42 paid regardless of which tenant created it.
+
+### Prioritization
+P2 — Depends on authentication existing (Finding 2). Remediate after auth is in place. If authentication is added without this fix, this IDOR becomes immediately exploitable by any authenticated user against any other user's invoice.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Attacker must be authenticated (or authentication must be absent, as in the current state). Invoice IDs are auto-increment integers, trivially guessable.
+- **Uncertainty Boundary:** If invoices are filtered by user at a layer not visible in scope, impact is reduced — but there is no visible ownership filter in this code.
+
+### Counterfactual Invalidation
+Adding an ownership check `if invoice.user_id != current_user.id: abort(403)` after the fetch would invalidate this finding.
+
+### Remediation
+After implementing authentication, enforce object-level ownership before acting:
+
+```python
+@app.route("/pay/<int:invoice_id>", methods=["POST"])
+@login_required
+def mark_invoice_paid(invoice_id):
+    invoice = Invoice.query.filter_by(id=invoice_id, user_id=current_user.id).first_or_404()
+    invoice.paid = True
+    db.session.commit()
+    return jsonify({"message": f"Invoice {invoice_id} marked as paid."})
+```
+
+Filtering by both `id` and `user_id` in the query itself prevents any row from being accessed unless it belongs to the caller.
+
+### References
+- https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+- https://cwe.mitre.org/data/definitions/862.html
+
+---
+
+## Finding 4: Sensitive Data Exposure — All Invoices Returned Without Tenant Scoping
+
+**Finding ID:** `APPSEC-9e6d2b3f78`  
+**File:** `main.py`  
+**Lines:** 51–54  
+**CWE:** CWE-284 — Improper Access Control  
+**OWASP Category:** A01:2021 – Broken Access Control  
+**Priority:** P2  
+**Severity:** MEDIUM  
+**Confidence:** HIGH  
 
 ### Vulnerable Code
 ```python
@@ -40,269 +244,104 @@ Five issues validated. Ordered below by pass-3 risk score.
 def list_invoices():
     invoices = Invoice.query.all()
     return jsonify([i.to_dict() for i in invoices])
-
-@app.route("/pay/<int:invoice_id>", methods=["POST"])
-def mark_invoice_paid(invoice_id):
-    invoice = Invoice.query.get_or_404(invoice_id)
-    invoice.paid = True
-    db.session.commit()
-    return jsonify({"message": f"Invoice {invoice_id} marked as paid."})
 ```
 
 ### Description
-No authentication or authorization check exists on any route. `GET /invoices` returns every invoice in the database — every customer name, billing address, and VAT ID — to any caller. `POST /pay/<invoice_id>` marks any invoice as paid without verifying the caller owns it; sequential enumeration of integer IDs (1, 2, 3…) is trivially sufficient. An unauthenticated attacker can exfiltrate the full customer PII dataset and mark arbitrary invoices paid, directly subverting financial integrity.
+`Invoice.query.all()` returns every row in the table with no filtering by user, tenant, or any other scope. The `to_dict()` method (lines 20–29) serializes `customer_name`, `billing_address`, and `vat_id` — all PII. Any caller (currently unauthenticated) receives the full invoice ledger for every customer, creating a data breach scenario where one user can harvest the personal and financial details of all other users.
 
 ### Prioritization
-Top remediation priority. All other findings are secondary; some become moot or materially worse once authentication is added. The absence of access control is the dominant threat in this codebase.
+P2 — Depends on authentication (Finding 2). Once auth exists, this query must be scoped to the current user's records; without scoping it becomes a horizontal privilege escalation at the data layer.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** None — any HTTP client suffices. `curl http://host/invoices` dumps all records; `curl -X POST http://host/pay/1` marks invoice #1 paid.
-- **Uncertainty Boundary:** None. Code is unambiguous.
-- **Counterfactual invalidation:** Adding `@login_required` plus filtering `Invoice.query.filter_by(user_id=current_user.id)` eliminates both the data-exposure and IDOR paths.
+- **Exploit Preconditions:** Network access to `GET /invoices`. Currently unauthenticated.
+- **Uncertainty Boundary:** If an upstream layer pre-filters results or enforces tenant context, impact is reduced. None visible in scope.
+
+### Counterfactual Invalidation
+Filtering the query by `user_id=current_user.id` would prevent cross-tenant data access.
 
 ### Remediation
 ```python
-# requirements.txt: add Flask-Login
-from flask_login import LoginManager, login_required, current_user
-
-login_manager = LoginManager(app)
-
-# Invoice model: add ownership column
-class Invoice(db.Model):
-    # ... existing fields ...
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-
 @app.route("/invoices", methods=["GET"])
 @login_required
 def list_invoices():
     invoices = Invoice.query.filter_by(user_id=current_user.id).all()
     return jsonify([i.to_dict() for i in invoices])
-
-@app.route("/pay/<int:invoice_id>", methods=["POST"])
-@login_required
-def mark_invoice_paid(invoice_id):
-    # filter_by enforces ownership — returns 404 if invoice belongs to another user
-    invoice = Invoice.query.filter_by(
-        id=invoice_id, user_id=current_user.id
-    ).first_or_404()
-    invoice.paid = True
-    db.session.commit()
-    return jsonify({"message": f"Invoice {invoice_id} marked as paid."})
 ```
 
 ### References
 - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
-- https://cwe.mitre.org/data/definitions/862.html
+- https://cwe.mitre.org/data/definitions/284.html
 
 ---
 
-## Finding 2: Mass Assignment — `paid` Flag Writable by Client
+## Finding 5: CSRF — State-Changing Pay Endpoint Lacks CSRF Protection
 
-**File:** `main.py`
-**Lines:** 39–49
-**CWE:** CWE-915 — Improperly Controlled Modification of Dynamically-Determined Object Attributes
-**OWASP Category:** A01:2021 – Broken Access Control
-**Priority:** P1
-**Severity:** HIGH
-**Confidence:** HIGH
-
-### Vulnerable Code
-```python
-@app.route("/invoices", methods=["POST"])
-def create_invoice():
-    data = request.json or {}
-
-    # Amount is server-controlled (e.g., from the authenticated user's plan/contract)
-    data["amount"] = get_amount_for_current_user()
-    invoice = Invoice(**data)   # all keys in data, including 'paid', bound to model
-
-    db.session.add(invoice)
-    db.session.commit()
-    return jsonify(invoice.to_dict()), 201
-```
-
-### Description
-`Invoice(**data)` passes every key from the attacker-controlled JSON body to the SQLAlchemy model constructor. `amount` is explicitly overwritten server-side on the line above, protecting it. `paid` is not overwritten; its model default (`False`) is never enforced when the client supplies a value. An attacker can POST `{"paid": true}` and create an invoice that enters the database already marked as paid — bypassing the payment flow (with its "proper payment logic" comment) entirely. The concrete payload is one line: `{"customer_name": "any", "paid": true}`.
-
-### Prioritization
-P1 alongside Finding 1. This is independently exploitable (no auth required) and directly subverts financial integrity. Remediating Finding 1 (auth) does not fix this; both must be patched.
-
-### Exploitability Notes
-- **Exploit Preconditions:** The `POST /invoices` endpoint must be reachable. It currently is, with no auth.
-- **Concrete attacker input:** `curl -X POST http://host/invoices -H 'Content-Type: application/json' -d '{"customer_name":"acme","paid":true}'` → creates invoice with `paid=True` in DB.
-- **Uncertainty Boundary:** None — `paid` is a plain model column, not write-protected anywhere.
-- **Counterfactual invalidation:** Filtering `data` to an explicit allowlist that excludes `paid` eliminates the path.
-
-### Remediation
-```python
-INVOICE_WRITABLE_FIELDS = {"customer_name", "billing_address", "vat_id", "description"}
-
-@app.route("/invoices", methods=["POST"])
-def create_invoice():
-    raw = request.json or {}
-
-    # Explicit allowlist — client cannot touch 'paid', 'amount', or any future field
-    data = {k: v for k, v in raw.items() if k in INVOICE_WRITABLE_FIELDS}
-
-    # Server-controlled fields
-    data["amount"] = get_amount_for_current_user()
-    # 'paid' intentionally absent — model default (False) applies
-
-    invoice = Invoice(**data)
-    db.session.add(invoice)
-    db.session.commit()
-    return jsonify(invoice.to_dict()), 201
-```
-
-### References
-- https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
-- https://cwe.mitre.org/data/definitions/915.html
-
----
-
-## Finding 3: CSRF — `POST /pay/<id>` Accepts Form Submissions
-
-**File:** `main.py`, `templates/index.html`
-**Lines:** `main.py` 56–63; `index.html` 33–36
-**CWE:** CWE-352 — Cross-Site Request Forgery
-**OWASP Category:** A01:2021 – Broken Access Control
-**Priority:** P2
-**Severity:** MEDIUM (escalates to HIGH once authentication is added)
-**Confidence:** HIGH
+**Finding ID:** `APPSEC-4c7a8e1d62`  
+**File:** `main.py`  
+**Lines:** 56–63  
+**CWE:** CWE-352 — Cross-Site Request Forgery  
+**OWASP Category:** A01:2021 – Broken Access Control  
+**Priority:** P3  
+**Severity:** MEDIUM  
+**Confidence:** MEDIUM  
 
 ### Vulnerable Code
 ```python
-# main.py — no CSRF token check
 @app.route("/pay/<int:invoice_id>", methods=["POST"])
 def mark_invoice_paid(invoice_id):
     invoice = Invoice.query.get_or_404(invoice_id)
     invoice.paid = True
-    db.session.commit()
-    return jsonify({"message": f"Invoice {invoice_id} marked as paid."})
-```
-```javascript
-// index.html — no CSRF token sent
-async function pay(id) {
-  await fetch(`/pay/${id}`, { method: "POST" });
-  load();
-}
 ```
 
 ### Description
-`POST /pay/<id>` carries no CSRF token and requires no request body. An attacker can embed a hidden HTML form on any page that auto-submits to `http://target/pay/42` — browsers will attach the victim's session cookie automatically. Because this endpoint takes no body, it is not protected by the browser's pre-flight CORS check (only non-simple content types trigger pre-flight). Once authentication is implemented, any authenticated user who visits a malicious page will silently mark the attacker-chosen invoice as paid. The `POST /invoices` JSON endpoint is less immediately exploitable via classic CSRF (browser blocks cross-origin `application/json` without a permissive CORS policy), but adding CORS later would re-open it.
+`POST /pay/<id>` accepts a body-less POST request and performs a state-changing operation (marking an invoice paid). The `POST /invoices` endpoint requires `Content-Type: application/json`, which browsers treat as a non-simple request requiring a CORS pre-flight — providing implicit CSRF protection. However, the pay endpoint requires no request body or specific content type, meaning a cross-origin HTML form submission (`<form method="POST" action="/pay/42">`) will be sent directly by the browser including session cookies, with no pre-flight. If cookie-based authentication is added, any malicious page visited by a logged-in user can silently mark invoices as paid.
 
 ### Prioritization
-P2 — exploitable only after authentication exists, but that remediation is P1 and should happen soon. CSRF protection must be added as part of the same development sprint.
+P3 — Contingent on cookie-based authentication being introduced (Findings 2, 3 take priority). Flag now so CSRF protection is included in any auth implementation.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Authentication must be in place and victim must visit attacker's page while logged in.
-- **Concrete attacker page:** `<form action="http://target/pay/1" method="POST"><script>document.forms[0].submit()</script></form>`
-- **Uncertainty Boundary:** Default browser `SameSite=Lax` cookie policy blocks cross-site POST for cookies set without an explicit `SameSite` attribute — but Flask does not set `SameSite` on session cookies by default, so the mitigation is browser-version-dependent and should not be relied upon.
-- **Counterfactual invalidation:** Adding Flask-WTF CSRF protection with a valid token requirement eliminates the attack.
+- **Exploit Preconditions:** Cookie-based session authentication must be in place; victim must visit attacker-controlled page while logged in; victim must have an invoice with a known ID.
+- **Uncertainty Boundary:** If auth is implemented with Bearer tokens (Authorization header) rather than cookies, CSRF is not exploitable via browser-initiated cross-origin requests.
+
+### Counterfactual Invalidation
+Adding Flask-WTF CSRF protection or requiring a `Content-Type: application/json` body on this endpoint would prevent form-based CSRF.
 
 ### Remediation
+Use Flask-WTF's CSRF extension to protect all state-changing endpoints:
+
 ```python
-# main.py
-from flask_wtf.csrf import CSRFProtect, generate_csrf
-
+from flask_wtf.csrf import CSRFProtect
 csrf = CSRFProtect(app)
-app.config["SECRET_KEY"] = os.environ["SECRET_KEY"]  # required for CSRF tokens
-
-# Expose token for JS fetch calls
-@app.route("/csrf-token")
-def csrf_token():
-    return jsonify({"token": generate_csrf()})
-```
-```javascript
-// index.html — fetch CSRF token once and attach to state-changing requests
-let csrfToken = "";
-
-async function initCsrf() {
-  const data = await (await fetch("/csrf-token")).json();
-  csrfToken = data.token;
-}
-
-async function pay(id) {
-  await fetch(`/pay/${id}`, {
-    method: "POST",
-    headers: { "X-CSRFToken": csrfToken }
-  });
-  load();
-}
 ```
 
-Also add to `app.config`: `SESSION_COOKIE_SAMESITE = "Lax"` and `SESSION_COOKIE_SECURE = True` (in production) for defense-in-depth.
+Or, restructure the pay endpoint to require a JSON body (forcing a CORS pre-flight for cross-origin requests):
+
+```python
+@app.route("/pay/<int:invoice_id>", methods=["POST"])
+@login_required
+def mark_invoice_paid(invoice_id):
+    # Require JSON body; browser cross-origin form POSTs cannot set Content-Type: application/json
+    if not request.is_json:
+        abort(400)
+    ...
+```
 
 ### References
-- https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+- https://owasp.org/www-community/attacks/csrf
 - https://cwe.mitre.org/data/definitions/352.html
 
 ---
 
-## Finding 4: Container Runs as Root
+## Finding 6: Security Misconfiguration — `FLASK_ENV=development` in Production Deployment
 
-**File:** `Dockerfile`
-**Lines:** 1–10
-**CWE:** CWE-250 — Execution with Unnecessary Privileges
-**OWASP Category:** A05:2021 – Security Misconfiguration
-**Priority:** P3
-**Severity:** MEDIUM
-**Confidence:** HIGH
-
-### Vulnerable Code
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "main.py"]
-```
-
-### Description
-No `USER` directive is present. The Flask process runs as UID 0 (root) inside the container. If any vulnerability in the application yields code execution (e.g., via a future injection flaw), the attacker gains root within the container, significantly lowering the bar for container escape or host-namespace attacks depending on runtime configuration.
-
-### Prioritization
-P3 — defense-in-depth measure; requires a prior RCE to matter. Address after the access-control findings.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Application must first be compromised via a code-execution vulnerability.
-- **Uncertainty Boundary:** Impact depends on container runtime hardening (`seccomp`, `AppArmor`, `--privileged` flags), none of which are visible in scope.
-- **Counterfactual invalidation:** Adding a `USER` directive dropping to a non-root UID removes root privileges from the process.
-
-### Remediation
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-CMD ["python", "main.py"]
-```
-
-### References
-- https://docs.docker.com/develop/security-best-practices/
-- https://cwe.mitre.org/data/definitions/250.html
-
----
-
-## Finding 5: `FLASK_ENV=development` in Production Compose File
-
-**File:** `docker-compose.yml`
-**Lines:** 8–9
-**CWE:** CWE-215 — Insertion of Sensitive Information Into Debugging Code
-**OWASP Category:** A05:2021 – Security Misconfiguration
-**Priority:** P4
-**Severity:** LOW
-**Confidence:** HIGH
+**Finding ID:** `APPSEC-7b5f3d9a01`  
+**File:** `docker-compose.yml`  
+**Lines:** 8–9  
+**CWE:** CWE-16 — Configuration  
+**OWASP Category:** A05:2021 – Security Misconfiguration  
+**Priority:** P3  
+**Severity:** LOW  
+**Confidence:** MEDIUM  
 
 ### Vulnerable Code
 ```yaml
@@ -311,26 +350,31 @@ environment:
 ```
 
 ### Description
-The compose file declares `FLASK_ENV=development` while `main.py:69` explicitly passes `debug=False`. These are inconsistent. `FLASK_ENV=development` enables Flask's reloader and can activate development-mode behaviors in Flask extensions (e.g., verbose error pages if `debug` is ever removed from `app.run()`). A developer who removes the explicit `debug=False` in the future — believing the environment variable controls it — would silently re-enable the interactive debugger, which provides an authenticated Python REPL on `/console`.
+The Docker Compose deployment configuration sets `FLASK_ENV=development`. In Flask versions prior to 2.2 this variable automatically enabled the Werkzeug interactive debugger (which provides a PIN-protected but dangerous RCE console on unhandled exceptions). In Flask 2.3.x (used here) `FLASK_ENV` was deprecated in favour of `FLASK_DEBUG`, and `app.run(debug=False)` on line 69 of `main.py` overrides any implicit debug enablement — so the Werkzeug debugger is likely not active. The risk is twofold: (1) future Flask upgrades or environment changes could restore the implicit debug-mode behaviour; (2) the variable creates confusion about the intended deployment environment, potentially leading operators to apply development-grade hardening assumptions to a production container.
 
 ### Prioritization
-P4 — no current exploitability; risk is future regression. Fix during the same sprint as the other findings.
+P3 informational; lower impact than Findings 1–5.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** A future code change removes `debug=False` from `app.run()`.
-- **Uncertainty Boundary:** Current code is not exploitable; risk is latent.
-- **Counterfactual invalidation:** Setting `FLASK_ENV=production` eliminates the inconsistency.
+- **Exploit Preconditions:** Behaviour change would require either a Flask downgrade or removal of the `debug=False` argument.
+- **Uncertainty Boundary:** Exact Flask 2.3.x handling of `FLASK_ENV` may vary by patch version.
 
 ### Remediation
+Remove the `FLASK_ENV` variable from the production compose file and replace with an explicit, safe configuration:
+
 ```yaml
-# docker-compose.yml
 environment:
-  - FLASK_ENV=production
-  - SECRET_KEY=${SECRET_KEY}   # inject via .env or secrets manager — never hardcode
+  - FLASK_DEBUG=0
+```
+
+And ensure `app.run()` in `main.py` does not set `debug=True` in production:
+```python
+app.run(host="0.0.0.0", port=5000, debug=False)
 ```
 
 ### References
-- https://flask.palletsprojects.com/en/2.3.x/config/#environment-and-debug-features
+- https://flask.palletsprojects.com/en/2.3.x/config/#DEBUG
+- https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
 
 ---
 
@@ -339,23 +383,23 @@ environment:
 ```
 ## Scan Summary
 
-| Metric         | Value |
-|----------------|-------|
-| Files Analyzed | 5     |
-| Total Findings | 5     |
-| Critical       | 1     |
-| High           | 1     |
-| Medium         | 2     |
-| Low            | 1     |
-| Info           | 0     |
+| Metric          | Value |
+|-----------------|-------|
+| Files Analyzed  | 5     |
+| Total Findings  | 6     |
+| Critical        | 0     |
+| High            | 3     |
+| Medium          | 2     |
+| Low             | 1     |
+| Info            | 0     |
 
 ### Key Risks
-The application exposes every customer record (PII + financials) to unauthenticated callers
-and allows any attacker to mark arbitrary invoices as paid — both with zero preconditions.
-A concurrent mass assignment flaw lets an attacker create invoices pre-marked as paid,
-bypassing the intended payment workflow entirely. Together these findings represent a total
-breakdown of data confidentiality and financial integrity.
+The most impactful finding is the mass assignment vulnerability (Finding 1): an attacker can
+create invoices pre-marked as paid by injecting `"paid": true` into the POST body, bypassing the
+entire payment flow. This combines directly with the absence of any authentication (Finding 2),
+meaning it is exploitable by anyone with network access and requires zero credentials. Together
+these two issues allow unauthenticated financial fraud and full exposure of all customers' PII.
 ```
 
 ### Prioritization Notes
-Findings 1 and 2 are both P1: they are independently exploitable today with no preconditions, and remediating authentication alone does not fix the mass assignment bypass. Finding 3 is rated P2 because it requires authentication to be exploitable — but must be implemented in the same sprint to avoid shipping auth without CSRF protection. Findings 4–5 are hardening items with no current exploitability.
+Finding 1 (mass assignment of `paid`) is ordered first because it is both the most subtle and the most directly impactful: the developer explicitly protected `amount` but overlooked `paid`, making this the archetypal mass-assignment trap. Findings 2–4 are the broader access-control scaffolding failures that amplify every other finding's exploitability. Findings 5–6 are conditional or low-impact and should be addressed as part of the auth implementation, not as independent remediations.

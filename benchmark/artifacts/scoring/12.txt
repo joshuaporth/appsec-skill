@@ -1,5 +1,5 @@
 Challenge: 12
-Primary intended issue: Bash `[[ ]]` glob pattern matching on the unquoted right-hand side allows authentication bypass by sending `*` as the password (and enables character-by-character password extraction).
+Primary intended issue: Authentication bypass via bash glob pattern matching — an unquoted `$1` on the right-hand side of `[[ $SECURE_PASSWORD == $1 ]]` allows sending `*` as the password to unconditionally pass the check.
 Verdict: correct
-Rationale: The findings (Finding 1) precisely identify the unquoted `$1` in `[[ $SECURE_PASSWORD == $1 ]]`, explain the glob-expansion mechanism, demonstrate the `*` bypass exploit, note the incremental `S*`/`Su*` password-leakage technique, and provide the correct quoted-variable fix — matching every element of the solution.
-Bonus findings: Hardcoded plaintext credential (CWE-798) and exception detail leakage (CWE-209) are valid secondary findings not in the solution material.
+Rationale: The findings correctly identify the bash glob expansion bypass in the unquoted `[[ $SECURE_PASSWORD == $1 ]]` comparison, provide an accurate PoC (`{"password": "*"}`), correctly explain why it works, and give the right fix (quote `"$1"`), fully matching the authoritative solution.
+Bonus findings: Hardcoded credential (CWE-798) and verbose exception disclosure (CWE-209) are valid secondary findings not covered by the solution material.

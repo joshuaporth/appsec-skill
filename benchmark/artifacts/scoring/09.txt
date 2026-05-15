@@ -1,5 +1,5 @@
 Challenge: 09
-Primary intended issue: The app implements authentication but no authorization, allowing any logged-in user to edit any other user's profile (IDOR / missing object-level authorization).
+Primary intended issue: The app implements authentication but no authorization — any (logged-in) user can edit any other user's profile because the username is taken from the attacker-controlled request body rather than from the session.
 Verdict: correct
-Rationale: Finding 2 in the findings artifact precisely identifies the IDOR — username sourced from `request.form` rather than the session, with a tautological ownership check — which is exactly the intended vulnerability described in the solution.
-Bonus findings: Missing authentication stub (F1), CSRF (F3), XSS (F4), development-mode misconfiguration (F5), and container-runs-as-root (F6) are all valid additional observations.
+Rationale: Finding 2 precisely identifies the tautological ownership check and explains that the attacker supplies an arbitrary `username` in the POST body while the session identity is never consulted, exactly matching the solution's described vulnerability and its recommended fix (derive the username from the session instead).
+Bonus findings: Missing authentication stub (is_authenticated always True), debug-mode/Werkzeug RCE risk, missing CSRF protection, and potential stored XSS — all valid secondary observations.

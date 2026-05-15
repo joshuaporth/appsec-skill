@@ -1,5 +1,5 @@
 Challenge: 01
-Primary intended issue: Open redirect vulnerability via unvalidated `redirect_url` query parameter passed directly to Flask's `redirect()`.
+Primary intended issue: Open Redirect via unvalidated `redirect_url` query parameter passed directly to Flask's `redirect()` (CWE-601).
 Verdict: correct
-Rationale: The findings correctly identify the open redirect (Finding 2, CWE-601) with accurate code location, exploitation mechanics, and remediation strategies (allowlist / relative-path enforcement) that match the solution's guidance exactly.
-Bonus findings: Log injection on line 20 (CWE-532 / CWE-117) correctly identified — solution author noted this as a bonus finding.
+Rationale: The findings clearly identify the open redirect on lines 18–21 as a primary P1 finding, correctly characterizes the attack vector (attacker-controlled `redirect_url` → arbitrary external redirect), and proposes allowlisting/relative-path validation and `url_for` as fixes — exactly matching the solution's intended issue and remediation guidance.
+Bonus findings: Log injection (Finding 3 / CWE-117) is explicitly called out and credited as a bonus in the solution; also flagged the authentication stub, which the solution acknowledges as valid given the lack of additional context.

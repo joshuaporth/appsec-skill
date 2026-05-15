@@ -50,7 +50,7 @@ Most agent prompts for “check my code for security” stay one-shot and shallo
 | 📎 **Spec-shaped** | Standard **`SKILL.md`** + **`references/`** tree ([Skill layout](#agent-skills-layout)); ensure your host’s discovery paths include [`skill/`](./skill/). |
 | 🧳 **Portable** | Plain Markdown skill content—no bundled runtime or API gate for **`skill/`** itself. |
 | 🗺️ **Depth** | Catalog + per-language foot-guns + crypto section. |
-| 📊 **Parseable output** | Shared schema in [`05-output-format.md`](./skill/references/05-output-format.md). |
+| 📊 **Parseable output** | Shared schema in [`05-output-format.md`](./skill/references/05-output-format.md), including stable finding IDs and SARIF-friendly field mapping. |
 | 🛠️ **Real fixes** | Language-aware remediation in [`06-remediation.md`](./skill/references/06-remediation.md). |
 
 <h2 id="how-it-works">🧭 How it works</h2>
@@ -122,6 +122,7 @@ Findings use the schema in [`05-output-format.md`](./skill/references/05-output-
 
 **Finding 1: SQL Injection**
 
+**Finding ID:** `APPSEC-3f1a92c4e0b1`  
 **File:** `app/db.py`  
 **Lines:** 12–14  
 **CWE:** CWE-89 — Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')  
@@ -180,7 +181,7 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 
 | Piece | Location |
 |:-----|:---------|
-| Skill entrypoint | [`skill/SKILL.md`](./skill/SKILL.md) (YAML frontmatter + body; ordered `references/` list) |
+| Skill entrypoint | [`skill/SKILL.md`](./skill/SKILL.md) (YAML frontmatter with metadata such as `version` / `spec_version`, plus the ordered `references/` list) |
 | Reference modules | [`skill/references/*.md`](./skill/references/) — read in the order `SKILL.md` specifies |
 
 **Discovery paths** vary by vendor (project `.cursor/skills`, user-level dirs, Claude Code bundles, etc.). Use the layout table above for **what’s inside** the folder; use each product’s docs for **where** it expects skills—for example Cursor’s **[Agent Skills](https://cursor.com/docs/skills)** guide. No compatibility matrix is maintained here.
@@ -200,14 +201,22 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 
 Optional regression for **`skill/`**: scripted **Findings → Scoring** over challenges **01–30** (**31–32** out of scope) via **Claude Code**, with spoilers stripped during staging. Protocol: [`.cursor/skills/benchmark/SKILL.md`](./.cursor/skills/benchmark/SKILL.md).
 
+- **Artifact policy:** commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` as frozen golden transcripts for regression comparisons, scoreboard generation, and learning passes. Treat `*.trace.log` and transient `*.txt.tmp` files as disposable run byproducts.
+- **CLI:** `benchmark/findings.sh` and `benchmark/scoring.sh` take `--start`, `--end`, `--parallel`, `--model`, and `--trace` (defaults: `1`, `30`, `30`). Run `--help` on either script. Optional env: `CLAUDE=/path/to/claude`.
+- **Smoke run:** use a small range first when iterating on wording or scripts:
+
 ```bash
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/findings.sh
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/scoring.sh
+./benchmark/findings.sh --start 1 --end 5 --parallel 5 --model sonnet
+./benchmark/scoring.sh --start 1 --end 5 --parallel 5 --model sonnet
+./benchmark/findings.sh --model sonnet
+./benchmark/scoring.sh --model sonnet
 ```
+
+- **Why 31–32 are excluded:** the maintainer harness is intentionally frozen to the blind 01–30 set so score comparisons stay stable across runs and do not depend on later challenge additions.
 
 <h2 id="contributing">🤝 Contributing</h2>
 
-Improvements to skills or docs are welcome—**small, focused PRs** make it easier to review security-sensitive wording.
+Improvements to skills or docs are welcome—**small, focused PRs** make it easier to review security-sensitive wording. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for maintainer checks, file selection guidance, and benchmark artifact policy.
 
 <h2 id="license">📄 License</h2>
 

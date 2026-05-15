@@ -1,5 +1,5 @@
 Challenge: 29
-Primary intended issue: Mass Assignment vulnerability in `POST /invoices` where a client can include `"paid": true` in the request body to create an invoice already marked as paid, bypassing the `/pay` endpoint.
+Primary intended issue: Mass Assignment vulnerability on `POST /invoices` allowing a client to inject `"paid": true` in the request body and create an invoice pre-marked as paid, bypassing the payment endpoint entirely.
 Verdict: correct
-Rationale: Finding 2 in the frozen findings precisely identifies the mass assignment flaw — that `Invoice(**data)` passes attacker-controlled JSON including `"paid": true` directly to the model, with a concrete exploit payload and correct remediation matching the solution's description.
-Bonus findings: IDOR/missing auth, CSRF, container-runs-as-root, and FLASK_ENV=development misconfiguration — all valid secondary findings.
+Rationale: Finding 1 in the frozen artifact precisely identifies the mass assignment flaw — attacker supplies `"paid": true` in the POST body, the `Invoice(**data)` constructor accepts it, and the invoice is persisted as paid — matching the solution's description exactly, including the correct exploit vector and the fix of explicitly setting `paid=False` server-side.
+Bonus findings: Missing authentication (Finding 2), IDOR on `/pay` (Finding 3), full invoice data exposure (Finding 4), CSRF risk (Finding 5), and `FLASK_ENV=development` misconfiguration (Finding 6) are all valid secondary findings.

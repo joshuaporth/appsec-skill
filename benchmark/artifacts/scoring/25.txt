@@ -1,5 +1,5 @@
 Challenge: 25
-Primary intended issue: NoSQL injection via untrusted JSON input passed directly as a MongoDB query filter, enabling authentication bypass using the `$ne` operator.
+Primary intended issue: NoSQL injection via untrusted JSON input passed directly as a MongoDB query filter, allowing authentication bypass without valid credentials.
 Verdict: correct
-Rationale: Finding 1 in the findings artifact precisely identifies the `map[string]interface{}` decoded body being passed directly as the MongoDB filter, provides a working `$ne` exploit payload, and recommends the exact remediation (typed struct + explicit `bson.D` filter) that the solution describes.
-Bonus findings: Valid extras include hardcoded credentials, plaintext password storage, unauthenticated MongoDB exposed on host network, and cleartext HTTP transmission — none penalize the primary finding.
+Rationale: The findings lead with a precisely described NoSQL operator injection (Finding 1) that matches the solution's intended primary issue exactly — untyped `map[string]interface{}` decoded from user input passed verbatim to `FindOne`, enabling operators like `$gt`/`$ne` to bypass authentication, with a correct typed-struct remediation aligned to the solution's guidance.
+Bonus findings: Valid secondary issues identified: plaintext password storage, hardcoded credentials, unauthenticated MongoDB port exposed to host network, and missing rate limiting.

@@ -1,5 +1,5 @@
 Challenge: 15
-Primary intended issue: HTTP Response Splitting via CRLF injection in Nginx's `$uri`-based redirect for the `/payment` location.
+Primary intended issue: HTTP Response Splitting via CRLF injection in the Nginx `/payment` redirect using `$uri` in a `return 302` directive.
 Verdict: correct
-Rationale: Finding 1 precisely identifies the `$uri` variable in the `return 302` directive as the attacker-controlled sink, describes CRLF injection via percent-encoded sequences, provides a concrete exploit payload matching the solution's example, and recommends the same remediation class (remove the attacker-controlled variable from the redirect).
-Bonus findings: Valid secondary issues noted — Flask port 5000 direct exposure (access control bypass), broad host bind mount (blast radius amplifier), and unpinned `nginx:latest` image.
+Rationale: Finding 1 in the findings artifact directly identifies CWE-113 CRLF injection at `nginx.conf` lines 14–16, correctly explains that `$uri` is interpolated into the `Location` header enabling HTTP response splitting, and even provides an identical exploit example (`%0d%0a` in the path), fully aligning with the solution's intended primary issue.
+Bonus findings: Flask exposed on port 5000 bypassing Nginx (Finding 2), missing security headers (Finding 3), and plaintext HTTP for payment redirect (Finding 4) are all valid secondary observations.

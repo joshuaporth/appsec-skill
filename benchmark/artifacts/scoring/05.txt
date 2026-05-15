@@ -1,5 +1,5 @@
 Challenge: 05
 Primary intended issue: The code is vulnerable to XML External Entity (XXE) injection due to an unsecured `DocumentBuilderFactory` parsing attacker-controlled XML input.
 Verdict: correct
-Rationale: The findings correctly identify XXE (CWE-611) as the primary critical vulnerability, pinpoint the exact vulnerable `DocumentBuilderFactory` / `DocumentBuilder` code, explain the exploit mechanism (DOCTYPE + external entity → file read / SSRF), and provide remediation aligned with the OWASP XXE Cheat Sheet referenced in the solution.
-Bonus findings: Valid secondary findings include error message information disclosure (CWE-209), container running as root (CWE-250), and missing authentication on the endpoint — all consistent with the codebase but not the primary intended issue.
+Rationale: The findings identify XXE (CWE-611) as the critical P1 issue, correctly pinpoint the unprotected `DocumentBuilderFactory.newInstance()` on the unauthenticated `/process` endpoint, provide a concrete exploit payload, and recommend disabling DOCTYPE declarations following the OWASP XXE Cheat Sheet — all precisely aligned with the solution's intended primary issue and remediation guidance.
+Bonus findings: Valid secondary findings include exception message information disclosure (CWE-209) and container running as root (CWE-250), both legitimate extras not present in the solution material.

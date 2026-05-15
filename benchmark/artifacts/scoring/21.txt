@@ -1,5 +1,5 @@
 Challenge: 21
-Primary intended issue: The `Origin` header is reflected verbatim into `Access-Control-Allow-Origin` while `Access-Control-Allow-Credentials: true` is also set, allowing any attacker-controlled origin to make authenticated cross-origin requests and read the victim's API key.
+Primary intended issue: CORS origin reflection with `Access-Control-Allow-Credentials: true` allows any attacker-controlled page to make authenticated cross-origin requests and read responses (credentialed CORS misconfiguration).
 Verdict: correct
-Rationale: Finding 2 in the findings precisely identifies the reflective CORS middleware, the `Access-Control-Allow-Credentials: true` pairing, the `SameSite: None` amplifier, and provides a concrete exploit payload — exactly matching the solution's described attack and fix direction.
-Bonus findings: unsigned authentication cookie enabling direct auth bypass (Finding 1), prototype-chain key bypass via `__proto__` cookie value (Finding 3), hardcoded API key placeholder (Finding 4), missing HTTP security headers (Finding 5).
+Rationale: Finding 1 precisely identifies the origin-reflection + credentials anti-pattern, explains the full exploit chain including the `sameSite: "none"` amplifier, and recommends an origin allowlist — exactly matching the solution's described vulnerability and fix.
+Bonus findings: Valid extras include `SameSite=None` on the auth cookie (Finding 2), unauthenticated `/mock-login` (Finding 3), hardcoded API key (Finding 4), and missing security headers (Finding 5).
