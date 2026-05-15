@@ -202,13 +202,14 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 Optional regression for **`skill/`**: scripted **Findings → Scoring** over challenges **01–30** (**31–32** out of scope) via **Claude Code**, with spoilers stripped during staging. Protocol: [`.cursor/skills/benchmark/SKILL.md`](./.cursor/skills/benchmark/SKILL.md).
 
 - **Artifact policy:** commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` as frozen golden transcripts for regression comparisons, scoreboard generation, and learning passes. Treat `*.trace.log` and transient `*.txt.tmp` files as disposable run byproducts.
+- **CLI:** `benchmark/findings.sh` and `benchmark/scoring.sh` take `--start`, `--end`, `--parallel`, `--model`, and `--trace` (defaults: `1`, `30`, `30`). Run `--help` on either script. Optional env: `CLAUDE=/path/to/claude`.
 - **Smoke run:** use a small range first when iterating on wording or scripts:
 
 ```bash
-START=1 END=5 MAX_PARALLEL=5 ./benchmark/findings.sh
-START=1 END=5 MAX_PARALLEL=5 ./benchmark/scoring.sh
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/findings.sh
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/scoring.sh
+./benchmark/findings.sh --start 1 --end 5 --parallel 5 --model sonnet
+./benchmark/scoring.sh --start 1 --end 5 --parallel 5 --model sonnet
+./benchmark/findings.sh --model sonnet
+./benchmark/scoring.sh --model sonnet
 ```
 
 - **Why 31–32 are excluded:** the maintainer harness is intentionally frozen to the blind 01–30 set so score comparisons stay stable across runs and do not depend on later challenge additions.

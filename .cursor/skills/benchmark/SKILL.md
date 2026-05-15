@@ -40,17 +40,34 @@ Never interleave phases:
 
 ## Script commands (canonical)
 
-Run from repo root:
+Run from repo root. CLI flags only (see `./benchmark/findings.sh --help`):
+
+| Flag | Default |
+|------|---------|
+| `--start` | `1` |
+| `--end` | `30` |
+| `--parallel` | `30` |
+| `--model` | Claude default if omitted |
+| `--trace` | off (debug: writes `NN.trace.log` under artifacts) |
+
+Full run (`01..30`, 30 workers):
 
 ```bash
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/findings.sh
-START=1 END=30 MAX_PARALLEL=30 ./benchmark/scoring.sh
+./benchmark/findings.sh --model sonnet
+./benchmark/scoring.sh --model sonnet
+```
+
+Subset or retry (example: challenge 15 only, serial):
+
+```bash
+./benchmark/findings.sh --start 15 --end 15 --parallel 1 --model sonnet
+./benchmark/scoring.sh --start 15 --end 15 --parallel 1 --model sonnet
 ```
 
 Notes:
 
 - Findings must fully finish before Scoring starts.
-- Use script-level parallelism (`MAX_PARALLEL=30`) for both phases.
+- Optional env: `CLAUDE=/path/to/claude` if the binary is not on PATH.
 - Do not substitute with ad-hoc per-challenge Task orchestration for this skill.
 
 ## Artifact completeness gates

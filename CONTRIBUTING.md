@@ -21,6 +21,7 @@ Small, focused pull requests are preferred. This repo encodes security-review gu
 - Commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` when they are intentional golden artifacts for comparison.
 - Do not commit `*.trace.log` files or transient `*.txt.tmp` files from interrupted benchmark runs.
 - Keep the maintainer harness frozen to challenges `01..30` unless the benchmark contract is intentionally revised.
+- Run the harness via `./benchmark/findings.sh` and `./benchmark/scoring.sh` (see `--help` for flags).
 
 ## Validation
 

@@ -6,42 +6,98 @@
 #
 # stdout is saved as benchmark/artifacts/scoring/NN.txt.
 #
-# Watching long runs (--print): same pattern as benchmark/findings.sh:
-#   CLAUDE_TRACE=1 ./benchmark/scoring.sh
-#   tail -f benchmark/artifacts/scoring/NN.trace.log
+# Usage (defaults: start=1 end=30 parallel=30):
+#   ./benchmark/scoring.sh --model sonnet
+#   ./benchmark/scoring.sh --start 1 --end 5 --parallel 4 --model opus
 #
-# Parallelism (default: run many workers at once — cap via MAX_PARALLEL):
-#   MAX_PARALLEL=8 ./benchmark/scoring.sh
-# Serial (easier debugging):
-#   MAX_PARALLEL=1 ./benchmark/scoring.sh
-#
-# Optional wall clock per worker (requires timeout(1)):
-#   CLAUDE_LIMIT_SEC=600 START=1 END=1 ./benchmark/scoring.sh
-#
-# Usage:
-#   ./benchmark/scoring.sh
-#   START=1 END=5 MAX_PARALLEL=4 ./benchmark/scoring.sh
+# Optional: set CLAUDE=/path/to/claude if the binary is not on PATH.
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BENCH_ROOT="${SCRIPT_DIR}"
-FINDINGS_DIR="${FINDINGS_DIR:-${BENCH_ROOT}/artifacts/findings}"
+FINDINGS_DIR="${BENCH_ROOT}/artifacts/findings"
 OUT_DIR="${BENCH_ROOT}/artifacts/scoring"
 CLAUDE_BIN="${CLAUDE:-claude}"
 
-START="${START:-1}"
-END="${END:-30}"
-MAX_PARALLEL="${MAX_PARALLEL:-30}"
-CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
-
-CLAUDE_TRACE="${CLAUDE_TRACE:-0}"
-CLAUDE_DEBUG_FILTER="${CLAUDE_DEBUG_FILTER:-}"
-CLAUDE_LIMIT_SEC="${CLAUDE_LIMIT_SEC:-}"
-CLAUDE_LIMIT_KILL_GRACE="${CLAUDE_LIMIT_KILL_GRACE:-5}"
-
 mkdir -p "${OUT_DIR}"
+
+parse_benchmark_cli() {
+  local tag="scoring"
+
+  START=1
+  END=30
+  MAX_PARALLEL=30
+  CLAUDE_MODEL=""
+  CLAUDE_TRACE=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --start)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --start requires a value" >&2; exit 2; fi
+        START="$2"
+        shift 2
+        ;;
+      --end)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --end requires a value" >&2; exit 2; fi
+        END="$2"
+        shift 2
+        ;;
+      --parallel)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --parallel requires a value" >&2; exit 2; fi
+        MAX_PARALLEL="$2"
+        shift 2
+        ;;
+      --model)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --model requires a value (e.g. sonnet, opus)" >&2; exit 2; fi
+        CLAUDE_MODEL="$2"
+        shift 2
+        ;;
+      --trace)
+        CLAUDE_TRACE=1
+        shift
+        ;;
+      -h|--help)
+        cat <<EOF >&2
+Usage: ./benchmark/scoring.sh [options]
+
+Options:
+  --start N       First challenge index (default: 1)
+  --end N         Last challenge index (default: 30)
+  --parallel N    Max concurrent workers (default: 30)
+  --model ID      Pass-through to claude --model (alias or full id)
+  --trace         Verbose claude logs + benchmark/artifacts/scoring/NN.trace.log
+
+Optional env: CLAUDE=/path/to/claude
+EOF
+        exit 0
+        ;;
+      *)
+        echo "${tag}: unknown argument: $1" >&2
+        echo "Run: ./benchmark/scoring.sh --help" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if ! [[ "${START}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --start must be a positive integer (got: ${START})" >&2
+    exit 2
+  fi
+  if ! [[ "${END}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --end must be a positive integer (got: ${END})" >&2
+    exit 2
+  fi
+  if ! [[ "${MAX_PARALLEL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --parallel must be a positive integer (got: ${MAX_PARALLEL})" >&2
+    exit 2
+  fi
+  if [[ "${END}" -lt "${START}" ]]; then
+    echo "${tag}: --end must be >= --start" >&2
+    exit 2
+  fi
+}
 
 format_duration() {
   local total="$1"
@@ -87,7 +143,6 @@ print_progress() {
   fi
 }
 
-# Prefer solution.md; otherwise first benchmark/challenges/challenge-NN/solution* file.
 solution_src_for_challenge() {
   local chal="$1"
   if [[ -f "${chal}/solution.md" ]]; then
@@ -196,13 +251,13 @@ run_one() {
       --output-format text
       --permission-mode dontAsk
     )
+    if [[ -n "${CLAUDE_MODEL}" ]]; then
+      cc_args+=(--model "${CLAUDE_MODEL}")
+    fi
 
     if [[ "${CLAUDE_TRACE}" == "1" ]]; then
       cc_args+=(--verbose)
       cc_args+=(--debug-file "${OUT_DIR}/${nn}.trace.log")
-      if [[ -n "${CLAUDE_DEBUG_FILTER}" ]]; then
-        cc_args+=(-d "${CLAUDE_DEBUG_FILTER}")
-      fi
       echo "scoring: trace -> ${OUT_DIR}/${nn}.trace.log" >&2
     fi
 
@@ -211,21 +266,9 @@ run_one() {
     local prompt
     prompt="$(build_prompt "${nn}" "${stage}" "${sol_base}")"
 
-    local -a run
-    if [[ -n "${CLAUDE_LIMIT_SEC}" ]]; then
-      if ! command -v timeout >/dev/null 2>&1; then
-        echo "scoring: CLAUDE_LIMIT_SEC is set but timeout(1) not found on PATH" >&2
-        return 1
-      fi
-      echo "scoring: per-worker time limit CLAUDE_LIMIT_SEC=${CLAUDE_LIMIT_SEC}s" >&2
-      run=( timeout "-k${CLAUDE_LIMIT_KILL_GRACE}" "${CLAUDE_LIMIT_SEC}" "${CLAUDE_BIN}" "${cc_args[@]}" )
-    else
-      run=( "${CLAUDE_BIN}" "${cc_args[@]}" )
-    fi
-
     if ! (
       cd "${stage}"
-      printf '%s\n' "${prompt}" | "${run[@]}"
+      printf '%s\n' "${prompt}" | "${CLAUDE_BIN}" "${cc_args[@]}"
     ) >"${out_tmp}"; then
       return 1
     fi
@@ -236,6 +279,8 @@ run_one() {
 }
 
 main() {
+  parse_benchmark_cli "$@"
+
   if ! command -v "${CLAUDE_BIN}" >/dev/null 2>&1; then
     echo "scoring: '${CLAUDE_BIN}' not found. Install Claude Code or set CLAUDE=/path/to/claude" >&2
     exit 127
@@ -248,11 +293,6 @@ main() {
     run_list+=("${nn}")
   done
 
-  if [[ "${MAX_PARALLEL}" -lt 1 ]]; then
-    echo "scoring: MAX_PARALLEL must be >= 1" >&2
-    exit 2
-  fi
-
   local total done ok_count fail_count started_at
   total="${#run_list[@]}"
   done=0
@@ -260,16 +300,13 @@ main() {
   fail_count=0
   started_at="$(date +%s)"
 
-  echo "scoring: starting ${total} challenge(s) (START=${START} END=${END} MAX_PARALLEL=${MAX_PARALLEL})" >&2
+  echo "scoring: starting ${total} challenge(s) (start=${START} end=${END} parallel=${MAX_PARALLEL} model=${CLAUDE_MODEL:-default} trace=${CLAUDE_TRACE})" >&2
   print_progress "${done}" "${total}" "${ok_count}" "${fail_count}" 0 "${started_at}"
 
   if [[ "${MAX_PARALLEL}" -eq 1 ]]; then
     for nn in "${run_list[@]}"; do
       if run_one "${nn}"; then
         ok_count=$((ok_count + 1))
-      elif [[ "${CONTINUE_ON_ERROR}" == "1" ]]; then
-        fail_count=$((fail_count + 1))
-        echo "scoring: FAILED challenge-${nn} (continuing)" >&2
       else
         fail_count=$((fail_count + 1))
         done=$((done + 1))
@@ -290,9 +327,7 @@ main() {
       if ! wait "${pids[0]}"; then
         failed=1
         fail_count=$((fail_count + 1))
-        if [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
-          echo "scoring: a worker exited non-zero while throttling (${pids[0]})" >&2
-        fi
+        echo "scoring: a worker exited non-zero while throttling (${pids[0]})" >&2
       else
         ok_count=$((ok_count + 1))
       fi
@@ -310,9 +345,7 @@ main() {
     if ! wait "${pid}"; then
       failed=1
       fail_count=$((fail_count + 1))
-      if [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
-        echo "scoring: worker pid ${pid} exited non-zero" >&2
-      fi
+      echo "scoring: worker pid ${pid} exited non-zero" >&2
     else
       ok_count=$((ok_count + 1))
     fi
@@ -321,7 +354,7 @@ main() {
     print_progress "${done}" "${total}" "${ok_count}" "${fail_count}" "${active_count}" "${started_at}"
   done
 
-  if [[ "${failed}" -eq 1 ]] && [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
+  if [[ "${failed}" -eq 1 ]]; then
     exit 1
   fi
 }

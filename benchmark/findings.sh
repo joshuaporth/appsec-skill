@@ -3,35 +3,14 @@
 # AppSec skill into the stage as project-local Claude skills, run Claude Code with
 # cwd = temp directory (standalone project root), stdin: /appsec
 #
-# Layout after staging:
-#   <stage>/.claude/skills/appsec/SKILL.md
-#   <stage>/.claude/skills/appsec/references/*.md   (mirror of repo skill/)
-#   <stage>/...challenge files...
-#
 # stdout is saved as benchmark/artifacts/findings/NN.txt.
 #
-# Watching long runs (--print + text waits for the full turn; no partial stdout):
-#   CLAUDE_TRACE=1 ./benchmark/findings.sh
-# Enables --verbose (stderr) and --debug-file benchmark/artifacts/findings/NN.trace.log —
-# tail that file while the invocation runs:
-#   tail -f benchmark/artifacts/findings/01.trace.log
+# Usage (defaults: start=1 end=30 parallel=30):
+#   ./benchmark/findings.sh --model sonnet
+#   ./benchmark/findings.sh --start 1 --end 5 --parallel 4 --model opus
+#   ./benchmark/findings.sh --trace --start 1 --end 1 --model sonnet
 #
-# Optional: narrow debug noise — CLAUDE_DEBUG_FILTER=api,hooks  (passed to `claude -d`)
-#
-# If a challenge never completes (looks like bash "won't exit"), this script is blocked
-# on the Claude Code child. Cap wall time per challenge (GNU coreutils timeout(1)):
-#   CLAUDE_LIMIT_SEC=1800 START=1 END=1 ./benchmark/findings.sh
-# CLAUDE_LIMIT_KILL_GRACE (default 5) is SIGTERM→SIGKILL seconds for timeout -k.
-#
-# Parallelism (same pattern as benchmark/scoring.sh; cap concurrent Claude workers):
-#   MAX_PARALLEL=8 ./benchmark/findings.sh
-# Serial (one challenge at a time — previous default behavior):
-#   MAX_PARALLEL=1 ./benchmark/findings.sh
-#
-# Usage:
-#   ./benchmark/findings.sh
-#   START=1 END=5 MAX_PARALLEL=4 ./benchmark/findings.sh
-#   CLAUDE_TRACE=1 START=1 END=1 ./benchmark/findings.sh
+# Optional: set CLAUDE=/path/to/claude if the binary is not on PATH.
 #
 set -euo pipefail
 
@@ -41,20 +20,83 @@ BENCH_ROOT="${SCRIPT_DIR}"
 OUT_DIR="${BENCH_ROOT}/artifacts/findings"
 CLAUDE_BIN="${CLAUDE:-claude}"
 
-START="${START:-1}"
-END="${END:-30}"
-MAX_PARALLEL="${MAX_PARALLEL:-30}"
-CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
-
-# Set CLAUDE_TRACE=1 for progress-style logs alongside the final NN.txt transcript.
-CLAUDE_TRACE="${CLAUDE_TRACE:-0}"
-CLAUDE_DEBUG_FILTER="${CLAUDE_DEBUG_FILTER:-}"
-
-# Optional per-challenge wall clock (requires timeout(1), e.g. /usr/bin/timeout).
-CLAUDE_LIMIT_SEC="${CLAUDE_LIMIT_SEC:-}"
-CLAUDE_LIMIT_KILL_GRACE="${CLAUDE_LIMIT_KILL_GRACE:-5}"
-
 mkdir -p "${OUT_DIR}"
+
+parse_benchmark_cli() {
+  local tag="findings"
+
+  START=1
+  END=30
+  MAX_PARALLEL=30
+  CLAUDE_MODEL=""
+  CLAUDE_TRACE=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --start)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --start requires a value" >&2; exit 2; fi
+        START="$2"
+        shift 2
+        ;;
+      --end)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --end requires a value" >&2; exit 2; fi
+        END="$2"
+        shift 2
+        ;;
+      --parallel)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --parallel requires a value" >&2; exit 2; fi
+        MAX_PARALLEL="$2"
+        shift 2
+        ;;
+      --model)
+        if [[ $# -lt 2 ]]; then echo "${tag}: --model requires a value (e.g. sonnet, opus)" >&2; exit 2; fi
+        CLAUDE_MODEL="$2"
+        shift 2
+        ;;
+      --trace)
+        CLAUDE_TRACE=1
+        shift
+        ;;
+      -h|--help)
+        cat <<EOF >&2
+Usage: ./benchmark/findings.sh [options]
+
+Options:
+  --start N       First challenge index (default: 1)
+  --end N         Last challenge index (default: 30)
+  --parallel N    Max concurrent workers (default: 30)
+  --model ID      Pass-through to claude --model (alias or full id)
+  --trace         Verbose claude logs + benchmark/artifacts/findings/NN.trace.log
+
+Optional env: CLAUDE=/path/to/claude
+EOF
+        exit 0
+        ;;
+      *)
+        echo "${tag}: unknown argument: $1" >&2
+        echo "Run: ./benchmark/findings.sh --help" >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  if ! [[ "${START}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --start must be a positive integer (got: ${START})" >&2
+    exit 2
+  fi
+  if ! [[ "${END}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --end must be a positive integer (got: ${END})" >&2
+    exit 2
+  fi
+  if ! [[ "${MAX_PARALLEL}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${tag}: --parallel must be a positive integer (got: ${MAX_PARALLEL})" >&2
+    exit 2
+  fi
+  if [[ "${END}" -lt "${START}" ]]; then
+    echo "${tag}: --end must be >= --start" >&2
+    exit 2
+  fi
+}
 
 format_duration() {
   local total="$1"
@@ -117,7 +159,6 @@ stage_challenge() {
     "${src}/" "${dst}/"
 }
 
-# Repo canonical skill lives at skill/. Install as Claude Code discovery path.
 install_skill_in_stage() {
   local stage="$1"
   mkdir -p "${stage}/.claude/skills/appsec"
@@ -162,34 +203,21 @@ run_challenge() {
       --output-format text
       --permission-mode dontAsk
     )
+    if [[ -n "${CLAUDE_MODEL}" ]]; then
+      cc_args+=(--model "${CLAUDE_MODEL}")
+    fi
 
     if [[ "${CLAUDE_TRACE}" == "1" ]]; then
       cc_args+=(--verbose)
       cc_args+=(--debug-file "${OUT_DIR}/${nn}.trace.log")
-      if [[ -n "${CLAUDE_DEBUG_FILTER}" ]]; then
-        cc_args+=(-d "${CLAUDE_DEBUG_FILTER}")
-      fi
       echo "findings: trace -> ${OUT_DIR}/${nn}.trace.log (tail -f in another terminal)" >&2
     fi
 
     echo "findings: challenge-${nn} project=${stage} -> /appsec -> ${out}" >&2
 
-    local -a run
-    if [[ -n "${CLAUDE_LIMIT_SEC}" ]]; then
-      if ! command -v timeout >/dev/null 2>&1; then
-        echo "findings: CLAUDE_LIMIT_SEC is set but timeout(1) not found on PATH" >&2
-        return 1
-      fi
-      echo "findings: per-challenge time limit CLAUDE_LIMIT_SEC=${CLAUDE_LIMIT_SEC}s" >&2
-      run=( timeout "-k${CLAUDE_LIMIT_KILL_GRACE}" "${CLAUDE_LIMIT_SEC}" "${CLAUDE_BIN}" "${cc_args[@]}" )
-    else
-      run=( "${CLAUDE_BIN}" "${cc_args[@]}" )
-    fi
-
-    # cwd = staged project root; stdin is only /appsec (skill + codebase both under stage).
     if ! (
       cd "${stage}"
-      printf '/appsec\n' | "${run[@]}"
+      printf '/appsec\n' | "${CLAUDE_BIN}" "${cc_args[@]}"
     ) >"${out_tmp}"; then
       return 1
     fi
@@ -201,14 +229,11 @@ run_challenge() {
 }
 
 main() {
+  parse_benchmark_cli "$@"
+
   if ! command -v "${CLAUDE_BIN}" >/dev/null 2>&1; then
     echo "findings: '${CLAUDE_BIN}' not found. Install Claude Code or set CLAUDE=/path/to/claude" >&2
     exit 127
-  fi
-
-  if [[ "${MAX_PARALLEL}" -lt 1 ]]; then
-    echo "findings: MAX_PARALLEL must be >= 1" >&2
-    exit 2
   fi
 
   declare -a run_list=()
@@ -225,16 +250,13 @@ main() {
   fail_count=0
   started_at="$(date +%s)"
 
-  echo "findings: starting ${total} challenge(s) (START=${START} END=${END} MAX_PARALLEL=${MAX_PARALLEL})" >&2
+  echo "findings: starting ${total} challenge(s) (start=${START} end=${END} parallel=${MAX_PARALLEL} model=${CLAUDE_MODEL:-default} trace=${CLAUDE_TRACE})" >&2
   print_progress "${done}" "${total}" "${ok_count}" "${fail_count}" 0 "${started_at}"
 
   if [[ "${MAX_PARALLEL}" -eq 1 ]]; then
     for nn in "${run_list[@]}"; do
       if run_challenge "${nn}"; then
         ok_count=$((ok_count + 1))
-      elif [[ "${CONTINUE_ON_ERROR}" == "1" ]]; then
-        fail_count=$((fail_count + 1))
-        echo "findings: FAILED challenge-${nn} (continuing)" >&2
       else
         fail_count=$((fail_count + 1))
         done=$((done + 1))
@@ -255,9 +277,7 @@ main() {
       if ! wait "${pids[0]}"; then
         failed=1
         fail_count=$((fail_count + 1))
-        if [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
-          echo "findings: a worker exited non-zero while throttling (${pids[0]})" >&2
-        fi
+        echo "findings: a worker exited non-zero while throttling (${pids[0]})" >&2
       else
         ok_count=$((ok_count + 1))
       fi
@@ -275,9 +295,7 @@ main() {
     if ! wait "${pid}"; then
       failed=1
       fail_count=$((fail_count + 1))
-      if [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
-        echo "findings: worker pid ${pid} exited non-zero" >&2
-      fi
+      echo "findings: worker pid ${pid} exited non-zero" >&2
     else
       ok_count=$((ok_count + 1))
     fi
@@ -286,7 +304,7 @@ main() {
     print_progress "${done}" "${total}" "${ok_count}" "${fail_count}" "${active_count}" "${started_at}"
   done
 
-  if [[ "${failed}" -eq 1 ]] && [[ "${CONTINUE_ON_ERROR}" != "1" ]]; then
+  if [[ "${failed}" -eq 1 ]]; then
     exit 1
   fi
 }
