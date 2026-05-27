@@ -1,6 +1,5 @@
 .cursor/plans/
 __pycache__/
-benchmark/synthetics/**/node_modules/
 
 # Benchmark transcripts are committed golden artifacts; ignore only ephemeral run byproducts.
 benchmark/artifacts/findings/*.trace.log
