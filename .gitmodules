@@ -1,3 +1,6 @@
 [submodule "benchmark/challenges"]
 	path = benchmark/challenges
 	url = git@github.com:dub-flow/secure-code-review-challenges.git
+[submodule "benchmark/synthetics"]
+	path = benchmark/synthetics
+	url = git@github.com:joshuaporth/secure-code-review-fixtures.git

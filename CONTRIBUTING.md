@@ -16,6 +16,30 @@ Small, focused pull requests are preferred. This repo encodes security-review gu
 - Update `skill/references/03-language-specific.md` for language or framework foot-guns that fit the existing "Flag / Safe alternatives" pattern.
 - Update `skill/references/05-output-format.md` when changing report schema or machine-readable mapping expectations.
 
+## Secure code review fixtures (submodule)
+
+The 190-challenge synthetic corpus lives in a separate repository, pinned as [`benchmark/synthetics/`](benchmark/synthetics/) ([secure-code-review-fixtures](https://github.com/joshuaporth/secure-code-review-fixtures)).
+
+Initialize after clone:
+
+```bash
+git submodule update --init benchmark/synthetics
+```
+
+Challenge edits, manifest updates, and corpus CI belong in **that repo**. This repo keeps thin wrappers for convenience:
+
+```bash
+python3 scripts/validate_synthetic_challenges.py --core-only
+./scripts/run_core_exploit_demos.sh
+./benchmark/synthetics/core/challenge-16/exploit/demo.sh
+```
+
+The **benchmark subset** is every challenge with `"benchmark_core": true` in the fixtures manifest (80 synthetics + upstream `benchmark/challenges` 01–30).
+
+### Before promoting fixtures into `benchmark/challenges`
+
+Run validation and demos in the fixtures repo, then a small pilot findings/scoring pass on representative core IDs in this repo.
+
 ## Benchmark artifact policy
 
 - Commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` when they are intentional golden artifacts for comparison.

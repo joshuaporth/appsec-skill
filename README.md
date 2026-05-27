@@ -194,7 +194,7 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 |:-----|:-----|
 | [`LICENSE`](./LICENSE) | MIT license for instructional materials |
 | [`skill/`](./skill/) | **The product:** [`SKILL.md`](./skill/SKILL.md) + [`references/`](./skill/references/) |
-| [`benchmark/`](./benchmark/) | Optional maintainer harness — [evaluation](#maintainers-evaluation-harness) |
+| [`benchmark/`](./benchmark/) | Optional maintainer harness — [evaluation](#maintainers-evaluation-harness); fixtures submodule at [`benchmark/synthetics/`](./benchmark/synthetics/) |
 | [`.cursor/skills/`](./.cursor/skills/) | Small Cursor stubs for that harness only |
 
 <h2 id="maintainers-evaluation-harness">🛠️ Maintainers · evaluation harness</h2>
@@ -202,6 +202,8 @@ Use parameterized queries (`cur.execute("SELECT … WHERE id = ?", (user_id,))`)
 Optional regression for **`skill/`**: scripted **Findings → Scoring** over challenges **01–30** (**31–32** out of scope) via **Claude Code**, with spoilers stripped during staging. Protocol: [`.cursor/skills/benchmark/SKILL.md`](./.cursor/skills/benchmark/SKILL.md).
 
 - **Artifact policy:** commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` as frozen golden transcripts for regression comparisons, scoreboard generation, and learning passes. Treat `*.trace.log` and transient `*.txt.tmp` files as disposable run byproducts.
+
+- **Fixtures corpus:** 190 synthetic labs in [`benchmark/synthetics/`](./benchmark/synthetics/) ([secure-code-review-fixtures](https://github.com/joshuaporth/secure-code-review-fixtures)); run `git submodule update --init benchmark/synthetics` after clone.
 - **CLI:** `benchmark/findings.sh` and `benchmark/scoring.sh` take `--start`, `--end`, `--parallel`, `--model`, and `--trace` (defaults: `1`, `30`, `30`). Run `--help` on either script. Optional env: `CLAUDE=/path/to/claude`.
 - **Smoke run:** use a small range first when iterating on wording or scripts:
 

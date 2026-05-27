@@ -1,3 +1,4 @@
 # Ignore benchmark challenge repos so Cursor indexing does not ingest spoilers.
 # Maintainer workflow and blind-review staging: .cursor/skills/benchmark/SKILL.md
-benchmark/challenges/
+benchmark/challenges/**
+benchmark/synthetics/**
