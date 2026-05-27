@@ -16,8 +16,11 @@ Small, focused pull requests are preferred. This repo encodes security-review gu
 - Update `skill/references/03-language-specific.md` for language or framework foot-guns that fit the existing "Flag / Safe alternatives" pattern.
 - Update `skill/references/05-output-format.md` when changing report schema or machine-readable mapping expectations.
 
-## Benchmark artifact policy
+## Evaluation harness (optional)
 
+Most contributions target `skill/` and docs only. If you change benchmark artifacts or harness scripts:
+
+- Benchmark challenges and fixtures live in submodules: [`benchmark/challenges/`](benchmark/challenges/) ([dub-flow/secure-code-review-challenges](https://github.com/dub-flow/secure-code-review-challenges)) and [`benchmark/synthetics/`](benchmark/synthetics/) ([secure-code-review-fixtures](https://github.com/joshuaporth/secure-code-review-fixtures)). Edit those upstream repos; bump the submodule pointer here only when pinning a new revision.
 - Commit `benchmark/artifacts/findings/*.txt` and `benchmark/artifacts/scoring/*.txt` when they are intentional golden artifacts for comparison.
 - Do not commit `*.trace.log` files or transient `*.txt.tmp` files from interrupted benchmark runs.
 - Keep the maintainer harness frozen to challenges `01..30` unless the benchmark contract is intentionally revised.
@@ -32,3 +35,10 @@ python3 scripts/validate_repo.py
 ```
 
 This checks skill frontmatter, the ordered reference chain in `skill/SKILL.md`, and local markdown links used by the maintained docs.
+
+After initializing `benchmark/synthetics`, CI and maintainers use the fixtures repo scripts directly (no wrappers in this repo):
+
+```bash
+python3 benchmark/synthetics/scripts/validate.py --core-only
+./benchmark/synthetics/scripts/run_core_demos.sh
+```

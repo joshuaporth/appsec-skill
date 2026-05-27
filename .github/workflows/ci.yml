@@ -10,6 +10,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -18,3 +20,6 @@ jobs:
 
       - name: Validate skill metadata and markdown links
         run: python -B scripts/validate_repo.py
+
+      - name: Validate fixtures submodule (benchmark_core)
+        run: python -B benchmark/synthetics/scripts/validate.py --core-only
